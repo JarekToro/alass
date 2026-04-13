@@ -1,8 +1,10 @@
 [workspace]
+resolver = "2"
 
 members = [
     "alass-core",
-    "alass-cli"
+    "alass-cli",
+    "alass-service"
 ]
 
 [profile.release]
