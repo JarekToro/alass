@@ -212,8 +212,6 @@ impl AlignmentEngine {
             &sub_indices,
             subtitle,
             score,
-            &pcm_bytes,
-            film_start_ms,
             cfg.split_threshold_ms,
         );
 
@@ -373,13 +371,13 @@ impl AlignmentEngine {
             merged_pcm = new_pcm;
             merged_start = new_start;
             // film_end_ms grows to cover all merged chunks.
-            let ends: Vec<i64> = self
+            merged_end = self
                 .chunk_history
                 .iter()
                 .map(|p| p.film_end_ms)
                 .chain(std::iter::once(merged_end))
-                .collect();
-            merged_end = ends.into_iter().max().unwrap_or(merged_end);
+                .max()
+                .unwrap_or(merged_end);
         }
 
         (merged_pcm, merged_start, merged_end, merged_sr)
@@ -419,7 +417,6 @@ fn run_vad(
             break; // discard incomplete trailing frame
         }
         let frame_start_ms = film_start_ms + (frame_idx as i64) * 10;
-        let _frame_end_ms = frame_start_ms + 10;
 
         let is_voice = vad.is_voice_segment(frame).unwrap_or(false);
         if is_voice && !in_speech {
@@ -477,8 +474,6 @@ fn extract_anchors(
     sub_indices: &[usize],
     subtitle: &SubtitleState,
     score: f64,
-    _pcm_bytes: &[u8],
-    _film_start_ms: i64,
     split_threshold_ms: i64,
 ) -> Vec<Anchor> {
     if delta_ms_vec.is_empty() || delta_ms_vec.len() != sub_indices.len() {

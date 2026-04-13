@@ -15,6 +15,8 @@ pub struct SubtitleLine {
     pub corrected_start_ms: i64,
     /// Current corrected end time in milliseconds (starts equal to original).
     pub corrected_end_ms: i64,
+    /// Text content of this subtitle line (may be empty).
+    pub text: String,
 }
 
 /// Holds the parsed subtitle state, including all lines and the backing
@@ -63,6 +65,7 @@ impl SubtitleState {
                     original_end_ms: end_ms,
                     corrected_start_ms: start_ms,
                     corrected_end_ms: end_ms,
+                    text: entry.line.unwrap_or_default(),
                 }
             })
             .collect();
@@ -92,10 +95,8 @@ impl SubtitleState {
                 format_srt_time(line.corrected_start_ms.max(0)),
                 format_srt_time(line.corrected_end_ms.max(0))
             ));
-            // Retrieve the text from the original subtitle_file entries.
-            // We re-fetch each time to keep a simple data model.
-            // For the text portion we emit a placeholder when entries are unavailable.
-            out.push('\n');
+            out.push_str(&line.text);
+            out.push_str("\n\n");
         }
         out
     }
