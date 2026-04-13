@@ -41,35 +41,23 @@ impl AlignmentEngineTrait for AlignmentService {
         request: Request<proto::AudioChunk>,
     ) -> Result<Response<Self::IngestAudioStream>, Status> {
         let chunk = request.into_inner();
-        let engine = self.engine.clone();
 
-        let (tx, rx) = mpsc::channel(1024);
-
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            let changes = rt.block_on(async {
-                let mut eng = engine.lock().await;
-                eng.ingest_chunk(
+        let changes = {
+            let mut engine = self.engine.lock().await;
+            engine
+                .ingest_chunk(
                     chunk.pcm_data.to_vec(),
                     chunk.sample_rate,
                     chunk.film_start_ms,
                     chunk.film_end_ms,
                 )
-            });
+                .map_err(|e| Status::internal(e))?
+        };
 
-            match changes {
-                Ok(changes) => {
-                    for c in changes {
-                        let _ = rt.block_on(tx.send(Ok(c)));
-                    }
-                }
-                Err(e) => {
-                    let _ = rt.block_on(tx.send(Err(Status::internal(e))));
-                }
-            }
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join: {}", e)))?;
+        let (tx, rx) = mpsc::channel(changes.len().max(1));
+        for c in changes {
+            let _ = tx.try_send(Ok(c));
+        }
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
