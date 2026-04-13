@@ -20,6 +20,7 @@ pub struct EngineConfig {
     pub sweep_step_ms: i64,
     pub coverage_buffer_ms: i64,
     pub stitch_tolerance_ms: i64,
+    pub vad_mode: i32,
 }
 
 impl Default for EngineConfig {
@@ -33,6 +34,7 @@ impl Default for EngineConfig {
             sweep_step_ms: 1_000,
             coverage_buffer_ms: 10_000,
             stitch_tolerance_ms: 5_000,
+            vad_mode: 0,
         }
     }
 }
@@ -41,46 +43,39 @@ impl From<&proto::EngineConfig> for EngineConfig {
     fn from(p: &proto::EngineConfig) -> Self {
         let d = EngineConfig::default();
         Self {
-            quality_threshold: if p.quality_threshold != 0.0 {
-                p.quality_threshold as f64
-            } else {
-                d.quality_threshold
-            },
-            split_penalty: if p.split_penalty != 0 {
-                p.split_penalty as f64
-            } else {
-                d.split_penalty
-            },
-            min_anchor_spacing_ms: if p.min_anchor_spacing_ms != 0 {
-                p.min_anchor_spacing_ms as i64
-            } else {
-                d.min_anchor_spacing_ms
-            },
-            max_drift_ms: if p.max_drift_ms != 0 {
-                p.max_drift_ms as i64
-            } else {
-                d.max_drift_ms
-            },
-            split_threshold_ms: if p.split_threshold_ms != 0 {
-                p.split_threshold_ms as i64
-            } else {
-                d.split_threshold_ms
-            },
-            sweep_step_ms: if p.sweep_step_ms != 0 {
-                p.sweep_step_ms as i64
-            } else {
-                d.sweep_step_ms
-            },
-            coverage_buffer_ms: if p.coverage_buffer_ms != 0 {
-                p.coverage_buffer_ms as i64
-            } else {
-                d.coverage_buffer_ms
-            },
-            stitch_tolerance_ms: if p.stitch_tolerance_ms != 0 {
-                p.stitch_tolerance_ms as i64
-            } else {
-                d.stitch_tolerance_ms
-            },
+            quality_threshold: p
+                .quality_threshold
+                .map(|v| v as f64)
+                .unwrap_or(d.quality_threshold),
+            split_penalty: p
+                .split_penalty
+                .map(|v| v as f64)
+                .unwrap_or(d.split_penalty),
+            min_anchor_spacing_ms: p
+                .min_anchor_spacing_ms
+                .map(|v| v as i64)
+                .unwrap_or(d.min_anchor_spacing_ms),
+            max_drift_ms: p
+                .max_drift_ms
+                .map(|v| v as i64)
+                .unwrap_or(d.max_drift_ms),
+            split_threshold_ms: p
+                .split_threshold_ms
+                .map(|v| v as i64)
+                .unwrap_or(d.split_threshold_ms),
+            sweep_step_ms: p
+                .sweep_step_ms
+                .map(|v| v as i64)
+                .unwrap_or(d.sweep_step_ms),
+            coverage_buffer_ms: p
+                .coverage_buffer_ms
+                .map(|v| v as i64)
+                .unwrap_or(d.coverage_buffer_ms),
+            stitch_tolerance_ms: p
+                .stitch_tolerance_ms
+                .map(|v| v as i64)
+                .unwrap_or(d.stitch_tolerance_ms),
+            vad_mode: p.vad_mode.unwrap_or(d.vad_mode),
         }
     }
 }
@@ -88,14 +83,15 @@ impl From<&proto::EngineConfig> for EngineConfig {
 impl From<&EngineConfig> for proto::EngineConfig {
     fn from(c: &EngineConfig) -> Self {
         proto::EngineConfig {
-            quality_threshold: c.quality_threshold as f32,
-            split_penalty: c.split_penalty as i32,
-            min_anchor_spacing_ms: c.min_anchor_spacing_ms as i32,
-            max_drift_ms: c.max_drift_ms as i32,
-            split_threshold_ms: c.split_threshold_ms as i32,
-            sweep_step_ms: c.sweep_step_ms as i32,
-            coverage_buffer_ms: c.coverage_buffer_ms as i32,
-            stitch_tolerance_ms: c.stitch_tolerance_ms as i32,
+            quality_threshold: Some(c.quality_threshold as f32),
+            split_penalty: Some(c.split_penalty as i32),
+            min_anchor_spacing_ms: Some(c.min_anchor_spacing_ms as i32),
+            max_drift_ms: Some(c.max_drift_ms as i32),
+            split_threshold_ms: Some(c.split_threshold_ms as i32),
+            sweep_step_ms: Some(c.sweep_step_ms as i32),
+            coverage_buffer_ms: Some(c.coverage_buffer_ms as i32),
+            stitch_tolerance_ms: Some(c.stitch_tolerance_ms as i32),
+            vad_mode: Some(c.vad_mode),
         }
     }
 }
@@ -142,7 +138,7 @@ struct SubtitleState {
 // ---------------------------------------------------------------------------
 
 pub struct AlignmentEngine {
-    pub config: EngineConfig,
+    config: EngineConfig,
     subtitle: Option<SubtitleState>,
     anchors: Vec<Anchor>, // sorted by film_position_ms
     chunks: Vec<ProcessedChunk>,
@@ -165,6 +161,14 @@ impl AlignmentEngine {
         &self,
     ) -> tokio::sync::broadcast::Receiver<proto::LineChange> {
         self.change_tx.subscribe()
+    }
+
+    pub fn set_config(&mut self, config: EngineConfig) {
+        self.config = config;
+    }
+
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
     }
 
     // -----------------------------------------------------------------------
@@ -269,17 +273,48 @@ impl AlignmentEngine {
     }
 
     pub fn get_corrected_subtitle(&self) -> Option<(String, String)> {
+        let fmt = self.subtitle.as_ref()?.format_str.clone();
+        self.get_corrected_subtitle_as(&fmt)
+    }
+
+    pub fn export_srt(&self) -> Option<String> {
+        // Delegate to the unified corrected-subtitle path to avoid
+        // maintaining two independent serialisation codepaths.
+        let (content, _) = self.get_corrected_subtitle_as("srt")?;
+        Some(content)
+    }
+
+    /// Internal helper: produce corrected subtitle in the requested format.
+    fn get_corrected_subtitle_as(&self, target_format: &str) -> Option<(String, String)> {
         let sub = self.subtitle.as_ref()?;
 
-        // Re-parse, apply corrected timespans, serialize
         use subparse::{parse_bytes, SubtitleFormat};
-        let fmt = match sub.format_str.as_str() {
+        let src_fmt = match sub.format_str.as_str() {
             "srt" => SubtitleFormat::SubRip,
             "ass" | "ssa" => SubtitleFormat::SubStationAlpha,
             _ => return None,
         };
 
-        let mut sub_file = parse_bytes(fmt, &sub.raw_content, None, 30.0).ok()?;
+        let out_fmt = match target_format {
+            "srt" => SubtitleFormat::SubRip,
+            "ass" | "ssa" => SubtitleFormat::SubStationAlpha,
+            _ => return None,
+        };
+
+        // If converting across formats we'd need a different base file;
+        // for now only same-format or always-SRT is supported.
+        let base_fmt = if target_format == sub.format_str.as_str() {
+            src_fmt
+        } else {
+            out_fmt
+        };
+
+        // For SRT export when source is not SRT, build from scratch
+        if target_format == "srt" && sub.format_str != "srt" {
+            return Some((self.build_srt_from_scratch(sub), "srt".to_string()));
+        }
+
+        let mut sub_file = parse_bytes(base_fmt, &sub.raw_content, None, 30.0).ok()?;
 
         let corrected: Vec<subparse::SubtitleEntry> = sub
             .corrected_start_ms
@@ -298,13 +333,12 @@ impl AlignmentEngine {
         sub_file.update_subtitle_entries(&corrected).ok()?;
         let data = sub_file.to_data().ok()?;
         let text = String::from_utf8_lossy(&data).to_string();
-        Some((text, sub.format_str.clone()))
+        Some((text, target_format.to_string()))
     }
 
-    pub fn export_srt(&self) -> Option<String> {
-        let sub = self.subtitle.as_ref()?;
+    /// Fallback SRT builder for cross-format export.
+    fn build_srt_from_scratch(&self, sub: &SubtitleState) -> String {
         let mut out = String::new();
-
         for (i, text) in sub.line_texts.iter().enumerate() {
             let start = sub.corrected_start_ms[i];
             let end = sub.corrected_end_ms[i];
@@ -320,8 +354,7 @@ impl AlignmentEngine {
             }
             out.push('\n');
         }
-
-        Some(out)
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -347,7 +380,7 @@ impl AlignmentEngine {
             self.stitch_check(pcm_data, film_start_ms, film_end_ms, sample_rate);
 
         // ── 2. VAD ───────────────────────────────────────────────────────
-        let vad_spans = vad::run_vad(&eff_pcm, sample_rate, eff_start);
+        let vad_spans = vad::run_vad(&eff_pcm, sample_rate, eff_start, self.config.vad_mode);
         if vad_spans.is_empty() {
             return Ok(Vec::new());
         }
@@ -431,11 +464,14 @@ impl AlignmentEngine {
                 }
 
                 // ── 10. STORE CHUNK ──────────────────────────────────────
+                // PCM data is not retained — it was only needed for
+                // stitching during this ingest call.  Dropping it avoids
+                // unbounded memory growth for long sessions.
                 self.chunks.push(ProcessedChunk {
                     id: chunk_id,
                     film_start_ms: eff_start,
                     film_end_ms: eff_end,
-                    pcm_data: eff_pcm,
+                    pcm_data: Vec::new(),
                     sample_rate,
                     anchor_ids,
                 });
@@ -471,7 +507,8 @@ impl AlignmentEngine {
                 }
                 let adjacent_after = (c.film_end_ms - start).abs() <= tol;
                 let adjacent_before = (end - c.film_start_ms).abs() <= tol;
-                adjacent_after || adjacent_before
+                let overlaps = c.film_start_ms < end && c.film_end_ms > start;
+                adjacent_after || adjacent_before || overlaps
             });
 
             match found {
@@ -635,15 +672,19 @@ impl AlignmentEngine {
         groups
             .into_iter()
             .map(|group| {
-                let line_start = group.first().unwrap().0;
-                let line_end = group.last().unwrap().0 + 1;
+                // Use min/max of actual indices in the group rather than
+                // assuming contiguity — indices may be non-contiguous
+                // (e.g. [3, 7, 11]) when subtitle lines are sparse.
+                let line_start = group.iter().map(|&(idx, _)| idx).min().unwrap();
+                let line_end = group.iter().map(|&(idx, _)| idx).max().unwrap() + 1;
 
                 // Median delta
                 let mut ds: Vec<i64> = group.iter().map(|&(_, d)| d).collect();
                 ds.sort();
                 let median_delta = ds[ds.len() / 2];
 
-                // Film position = midpoint of group's subtitle range
+                // Film position = midpoint of the actual sampled lines'
+                // time range (first sampled start, last sampled end).
                 let first_start = sub.original_timespans[line_start].0;
                 let last_end = sub.original_timespans[line_end - 1].1;
                 let film_position = (first_start + last_end) / 2;
@@ -1482,6 +1523,57 @@ Fifth line
         assert_eq!(back.sweep_step_ms, cfg.sweep_step_ms);
         assert_eq!(back.coverage_buffer_ms, cfg.coverage_buffer_ms);
         assert_eq!(back.stitch_tolerance_ms, cfg.stitch_tolerance_ms);
+        assert_eq!(back.vad_mode, cfg.vad_mode);
+    }
+
+    #[test]
+    fn config_optional_fields_allow_zero() {
+        // With optional proto fields, explicitly setting a value to 0
+        // should be distinguishable from "not set" (which gets defaults).
+        let proto_cfg = proto::EngineConfig {
+            quality_threshold: Some(0.0),
+            split_penalty: Some(0),
+            min_anchor_spacing_ms: Some(0),
+            max_drift_ms: Some(0),
+            split_threshold_ms: Some(0),
+            sweep_step_ms: Some(0),
+            coverage_buffer_ms: Some(0),
+            stitch_tolerance_ms: Some(0),
+            vad_mode: Some(3),
+        };
+        let cfg = EngineConfig::from(&proto_cfg);
+        assert_eq!(cfg.quality_threshold, 0.0);
+        assert_eq!(cfg.split_penalty, 0.0);
+        assert_eq!(cfg.min_anchor_spacing_ms, 0);
+        assert_eq!(cfg.max_drift_ms, 0);
+        assert_eq!(cfg.split_threshold_ms, 0);
+        assert_eq!(cfg.sweep_step_ms, 0);
+        assert_eq!(cfg.coverage_buffer_ms, 0);
+        assert_eq!(cfg.stitch_tolerance_ms, 0);
+        assert_eq!(cfg.vad_mode, 3);
+    }
+
+    #[test]
+    fn config_unset_fields_get_defaults() {
+        // When no fields are set (all None), defaults should be used.
+        let proto_cfg = proto::EngineConfig {
+            quality_threshold: None,
+            split_penalty: None,
+            min_anchor_spacing_ms: None,
+            max_drift_ms: None,
+            split_threshold_ms: None,
+            sweep_step_ms: None,
+            coverage_buffer_ms: None,
+            stitch_tolerance_ms: None,
+            vad_mode: None,
+        };
+        let cfg = EngineConfig::from(&proto_cfg);
+        let d = EngineConfig::default();
+        assert_eq!(cfg.quality_threshold, d.quality_threshold);
+        assert_eq!(cfg.split_penalty, d.split_penalty);
+        assert_eq!(cfg.min_anchor_spacing_ms, d.min_anchor_spacing_ms);
+        assert_eq!(cfg.max_drift_ms, d.max_drift_ms);
+        assert_eq!(cfg.vad_mode, d.vad_mode);
     }
 
     // -- format_srt_time ----------------------------------------------------
@@ -1579,5 +1671,45 @@ Fifth line
         let (spans, indices) = eng.subtitle_window_with_indices(4000, 9000);
         assert_eq!(indices, vec![0, 1]);
         assert_eq!(spans.len(), 2);
+    }
+
+    // -- stitch overlap detection (#3) ----------------------------------------
+
+    #[test]
+    fn stitch_merges_overlapping_chunks() {
+        let mut eng = make_engine();
+        load_sample(&mut eng);
+
+        // Pre-existing chunk: 0–10000ms
+        eng.chunks.push(ProcessedChunk {
+            id: Uuid::new_v4(),
+            film_start_ms: 0,
+            film_end_ms: 10000,
+            pcm_data: vec![1, 2, 3, 4],
+            sample_rate: 16000,
+            anchor_ids: vec![],
+        });
+
+        // New chunk overlaps: 5000–15000ms
+        let new_pcm = vec![5, 6, 7, 8];
+        let (_, start, end, _) = eng.stitch_check(new_pcm, 5000, 15000, 16000);
+
+        assert_eq!(start, 0);
+        assert_eq!(end, 15000);
+        assert!(eng.chunks.is_empty());
+    }
+
+    // -- set_config / config() accessor (#9) ----------------------------------
+
+    #[test]
+    fn set_config_and_config_accessor() {
+        let mut eng = make_engine();
+        let mut cfg = EngineConfig::default();
+        cfg.vad_mode = 3;
+        cfg.max_drift_ms = 60_000;
+        eng.set_config(cfg.clone());
+
+        assert_eq!(eng.config().vad_mode, 3);
+        assert_eq!(eng.config().max_drift_ms, 60_000);
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tonic::{Request, Response, Status};
 
 use crate::engine::{AlignmentEngine, EngineConfig};
@@ -27,14 +27,14 @@ impl AlignmentEngineTrait for AlignmentService {
         let mut engine = self.engine.lock().await;
         let (count, format) = engine
             .load_subtitle(&msg.content, &msg.format)
-            .map_err(|e| Status::invalid_argument(e))?;
+            .map_err(Status::invalid_argument)?;
         Ok(Response::new(proto::LoadResult {
             line_count: count,
             format,
         }))
     }
 
-    type IngestAudioStream = ReceiverStream<Result<proto::LineChange, Status>>;
+    type IngestAudioStream = UnboundedReceiverStream<Result<proto::LineChange, Status>>;
 
     async fn ingest_audio(
         &self,
@@ -42,24 +42,29 @@ impl AlignmentEngineTrait for AlignmentService {
     ) -> Result<Response<Self::IngestAudioStream>, Status> {
         let chunk = request.into_inner();
 
-        let changes = {
-            let mut engine = self.engine.lock().await;
-            engine
-                .ingest_chunk(
-                    chunk.pcm_data.to_vec(),
-                    chunk.sample_rate,
-                    chunk.film_start_ms,
-                    chunk.film_end_ms,
-                )
-                .map_err(|e| Status::internal(e))?
-        };
+        // Fix #1: Move CPU-intensive ingest_chunk off the async executor
+        // by running it inside spawn_blocking with a blocking_lock.
+        let engine_ref = Arc::clone(&self.engine);
+        let changes = tokio::task::spawn_blocking(move || {
+            let mut engine = engine_ref.blocking_lock();
+            engine.ingest_chunk(
+                chunk.pcm_data.to_vec(),
+                chunk.sample_rate,
+                chunk.film_start_ms,
+                chunk.film_end_ms,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(Status::internal)?;
 
-        let (tx, rx) = mpsc::channel(changes.len().max(1));
+        // Fix #5: Use an unbounded channel so sends never silently fail.
+        let (tx, rx) = mpsc::unbounded_channel();
         for c in changes {
-            let _ = tx.try_send(Ok(c));
+            let _ = tx.send(Ok(c));
         }
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(UnboundedReceiverStream::new(rx)))
     }
 
     type WatchChangesStream = ReceiverStream<Result<proto::LineChange, Status>>;
@@ -83,8 +88,16 @@ impl AlignmentEngineTrait for AlignmentService {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Fix #6: Signal the client that events were missed
+                        // by closing the stream with an error status.
+                        let _ = tx
+                            .send(Err(Status::resource_exhausted(format!(
+                                "subscriber lagged, {} events dropped",
+                                n
+                            ))))
+                            .await;
+                        break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
@@ -153,7 +166,8 @@ impl AlignmentEngineTrait for AlignmentService {
     ) -> Result<Response<proto::Empty>, Status> {
         let msg = request.into_inner();
         let mut engine = self.engine.lock().await;
-        engine.config = EngineConfig::from(&msg);
+        // Fix #9: Use setter instead of direct field access
+        engine.set_config(EngineConfig::from(&msg));
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -162,6 +176,6 @@ impl AlignmentEngineTrait for AlignmentService {
         _request: Request<proto::Empty>,
     ) -> Result<Response<proto::EngineConfig>, Status> {
         let engine = self.engine.lock().await;
-        Ok(Response::new(proto::EngineConfig::from(&engine.config)))
+        Ok(Response::new(proto::EngineConfig::from(engine.config())))
     }
 }

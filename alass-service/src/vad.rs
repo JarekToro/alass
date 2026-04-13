@@ -6,7 +6,8 @@ use webrtc_vad::{SampleRate, Vad};
 /// `pcm_bytes`: 16-bit signed LE mono PCM
 /// `sample_rate`: 8000 or 16000
 /// `film_start_ms`: absolute film position of the first sample
-pub fn run_vad(pcm_bytes: &[u8], sample_rate: i32, film_start_ms: i64) -> Vec<TimeSpan> {
+/// `vad_mode`: WebRTC VAD aggressiveness 0–3 (0 = least aggressive, 3 = most aggressive)
+pub fn run_vad(pcm_bytes: &[u8], sample_rate: i32, film_start_ms: i64, vad_mode: i32) -> Vec<TimeSpan> {
     let rate = match sample_rate {
         8000 => SampleRate::Rate8kHz,
         16000 => SampleRate::Rate16kHz,
@@ -14,6 +15,13 @@ pub fn run_vad(pcm_bytes: &[u8], sample_rate: i32, film_start_ms: i64) -> Vec<Ti
     };
 
     let mut vad = Vad::new_with_rate(rate);
+    let mode = match vad_mode.clamp(0, 3) {
+        0 => webrtc_vad::VadMode::Quality,
+        1 => webrtc_vad::VadMode::LowBitrate,
+        2 => webrtc_vad::VadMode::Aggressive,
+        _ => webrtc_vad::VadMode::VeryAggressive,
+    };
+    vad.set_mode(mode);
 
     // 10ms frame: 8kHz → 80 samples, 16kHz → 160 samples
     let frame_samples = (sample_rate / 100) as usize;
