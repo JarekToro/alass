@@ -926,6 +926,71 @@ Fifth line
         engine.load_subtitle(SAMPLE_SRT, "srt").unwrap();
     }
 
+    // -- E2E helpers --------------------------------------------------------
+
+    /// Generate synthetic 16-bit LE mono PCM where `speech_segments` contain
+    /// a 400 Hz sine wave and everything else is silence.  The WebRTC VAD
+    /// (mode 0) reliably classifies the sine-wave frames as speech.
+    ///
+    /// `speech_segments` are `(start_ms, end_ms)` **relative to the start of
+    /// the buffer** (i.e. sample 0 corresponds to ms 0).
+    fn make_speech_pcm(
+        sample_rate: i32,
+        speech_segments: &[(i64, i64)],
+        total_duration_ms: i64,
+    ) -> Vec<u8> {
+        let total_samples = (sample_rate as i64 * total_duration_ms / 1000) as usize;
+        let mut samples = vec![0i16; total_samples];
+
+        let freq = 400.0_f64;
+        let amplitude = 10_000.0_f64;
+
+        for &(start_ms, end_ms) in speech_segments {
+            let start_sample = (sample_rate as i64 * start_ms / 1000) as usize;
+            let end_sample = (sample_rate as i64 * end_ms / 1000) as usize;
+            let end_sample = end_sample.min(total_samples);
+            for i in start_sample..end_sample {
+                let t = i as f64 / sample_rate as f64;
+                samples[i] =
+                    (amplitude * (2.0 * std::f64::consts::PI * freq * t).sin()) as i16;
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(total_samples * 2);
+        for s in &samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Build a valid SRT string from `(start_ms, end_ms, text)` tuples.
+    fn make_srt(segments: &[(i64, i64, &str)]) -> String {
+        let mut out = String::new();
+        for (i, &(start, end, text)) in segments.iter().enumerate() {
+            out.push_str(&format!("{}\n", i + 1));
+            out.push_str(&format!(
+                "{} --> {}\n",
+                format_srt_time(start),
+                format_srt_time(end),
+            ));
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
+        out
+    }
+
+    /// Panics if `|actual - expected| > tolerance`.
+    fn assert_within(actual: i64, expected: i64, tolerance: i64, label: &str) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{}: expected ~{} +/- {}, got {}",
+            label,
+            expected,
+            tolerance,
+            actual,
+        );
+    }
+
     // -- LoadSubtitle -------------------------------------------------------
 
     #[test]
@@ -1711,5 +1776,407 @@ Fifth line
 
         assert_eq!(eng.config().vad_mode, 3);
         assert_eq!(eng.config().max_drift_ms, 60_000);
+    }
+
+    // =======================================================================
+    // E2E tests — full ingest_chunk pipeline
+    // =======================================================================
+
+    #[test]
+    fn test_make_speech_pcm_produces_vad_spans() {
+        let pcm = make_speech_pcm(16000, &[(1000, 4000), (6000, 9000)], 10000);
+        let spans = vad::run_vad(&pcm, 16000, 0, 0);
+
+        assert!(
+            spans.len() >= 2,
+            "expected at least 2 VAD spans, got {}",
+            spans.len()
+        );
+
+        // First span should cover approximately 1000-4000ms
+        let s0_start = i64::from(spans[0].start);
+        let s0_end = i64::from(spans[0].end);
+        assert_within(s0_start, 1000, 200, "span0 start");
+        assert_within(s0_end, 4000, 200, "span0 end");
+
+        // Second span should cover approximately 6000-9000ms
+        let s1_start = i64::from(spans[1].start);
+        let s1_end = i64::from(spans[1].end);
+        assert_within(s1_start, 6000, 200, "span1 start");
+        assert_within(s1_end, 9000, 200, "span1 end");
+    }
+
+    // -- e2e: silence rejected ----------------------------------------------
+
+    #[test]
+    fn e2e_silence_rejected() {
+        let mut eng = make_engine();
+        load_sample(&mut eng);
+
+        // 40 seconds of silence at 16kHz
+        let pcm = vec![0u8; 16000 * 2 * 40];
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 40000).unwrap();
+
+        assert!(changes.is_empty(), "silence should produce no changes");
+        assert!(eng.get_anchors().is_empty());
+        assert!(eng.get_chunk_history().is_empty());
+
+        // Corrected times unchanged
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..sub.original_timespans.len() {
+            assert_eq!(sub.corrected_start_ms[i], sub.original_timespans[i].0);
+            assert_eq!(sub.corrected_end_ms[i], sub.original_timespans[i].1);
+        }
+    }
+
+    // -- e2e: constant positive offset --------------------------------------
+
+    #[test]
+    fn e2e_constant_offset_positive() {
+        let mut eng = make_engine();
+        load_sample(&mut eng);
+
+        // Audio speech occurs 3s AFTER subtitle timings.
+        // SAMPLE_SRT lines: 1-4s, 5-8s, 10-13s, 20-23s, 30-33s
+        // Shifted +3s:       4-7s, 8-11s, 13-16s, 23-26s, 33-36s
+        let pcm = make_speech_pcm(
+            16000,
+            &[
+                (4000, 7000),
+                (8000, 11000),
+                (13000, 16000),
+                (23000, 26000),
+                (33000, 36000),
+            ],
+            40000,
+        );
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 40000).unwrap();
+
+        assert!(!changes.is_empty(), "should produce changes");
+
+        // All changed lines should have delta approximately +3000
+        for c in &changes {
+            assert_within(
+                c.new_start_ms - c.old_start_ms,
+                3000,
+                1500,
+                &format!("line {} start delta", c.line_index),
+            );
+        }
+
+        // Anchors exist with positive delta
+        let anchors = eng.get_anchors();
+        assert!(!anchors.is_empty(), "should have at least 1 anchor");
+        for a in &anchors {
+            assert_within(a.delta_ms, 3000, 1500, "anchor delta");
+        }
+
+        // One chunk in history
+        assert_eq!(eng.get_chunk_history().len(), 1);
+
+        // Exported SRT reflects correction
+        let srt = eng.export_srt().unwrap();
+        // Line 1 original: 00:00:01,000 → should now be ~00:00:04,000
+        assert!(
+            !srt.contains("00:00:01,000 --> 00:00:04,000"),
+            "original timestamps should no longer appear in exported SRT"
+        );
+    }
+
+    // -- e2e: constant negative offset --------------------------------------
+
+    #[test]
+    fn e2e_constant_offset_negative() {
+        let mut eng = make_engine();
+
+        // Use custom SRT with higher offsets to avoid clipping into negatives
+        let srt = make_srt(&[
+            (5000, 8000, "Line one"),
+            (10000, 13000, "Line two"),
+            (20000, 23000, "Line three"),
+            (30000, 33000, "Line four"),
+            (40000, 43000, "Line five"),
+        ]);
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // Audio speech occurs 3s BEFORE subtitle timings.
+        // Shifted -3s: 2-5s, 7-10s, 17-20s, 27-30s, 37-40s
+        let pcm = make_speech_pcm(
+            16000,
+            &[
+                (2000, 5000),
+                (7000, 10000),
+                (17000, 20000),
+                (27000, 30000),
+                (37000, 40000),
+            ],
+            50000,
+        );
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 50000).unwrap();
+
+        assert!(!changes.is_empty(), "should produce changes");
+
+        for c in &changes {
+            assert_within(
+                c.new_start_ms - c.old_start_ms,
+                -3000,
+                1500,
+                &format!("line {} start delta", c.line_index),
+            );
+        }
+
+        let anchors = eng.get_anchors();
+        assert!(!anchors.is_empty());
+        for a in &anchors {
+            assert_within(a.delta_ms, -3000, 1500, "anchor delta");
+        }
+    }
+
+    // -- e2e: poor match rejected by quality gate ---------------------------
+
+    #[test]
+    fn e2e_poor_match_rejected_by_quality_gate() {
+        let mut cfg = EngineConfig::default();
+        cfg.quality_threshold = 0.5; // raised to ensure rejection
+        let mut eng = test_engine(cfg);
+        load_sample(&mut eng);
+
+        // Single short speech burst that doesn't match subtitle pattern
+        let pcm = make_speech_pcm(16000, &[(19000, 19500)], 40000);
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 40000).unwrap();
+
+        assert!(
+            changes.is_empty(),
+            "poor match should be rejected by quality gate"
+        );
+        assert!(eng.get_anchors().is_empty());
+        assert!(eng.get_chunk_history().is_empty());
+    }
+
+    // -- e2e: multi-chunk progressive alignment -----------------------------
+
+    #[test]
+    fn e2e_multi_chunk_progressive() {
+        let mut cfg = EngineConfig::default();
+        cfg.stitch_tolerance_ms = 0; // prevent stitching
+        cfg.min_anchor_spacing_ms = 5000; // allow anchors closer together
+        cfg.max_drift_ms = 10000; // narrow window so each chunk sees only its lines
+        cfg.coverage_buffer_ms = 5000;
+        let mut eng = test_engine(cfg);
+
+        // Two well-separated groups so each chunk's window captures only its lines.
+        let srt = make_srt(&[
+            (5000, 8000, "Group A line 1"),
+            (10000, 13000, "Group A line 2"),
+            (15000, 18000, "Group A line 3"),
+            (80000, 83000, "Group B line 1"),
+            (85000, 88000, "Group B line 2"),
+            (90000, 93000, "Group B line 3"),
+        ]);
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // Offset: +2000ms
+
+        // Chunk 1: film 0-25s, covers group A shifted +2s
+        // Speech at (7-10s), (12-15s), (17-20s)
+        let pcm1 = make_speech_pcm(
+            16000,
+            &[(7000, 10000), (12000, 15000), (17000, 20000)],
+            25000,
+        );
+        let changes1 = eng.ingest_chunk(pcm1, 16000, 0, 25000).unwrap();
+        assert!(!changes1.is_empty(), "chunk 1 should produce changes");
+        assert!(
+            !eng.get_anchors().is_empty(),
+            "chunk 1 should create anchors"
+        );
+
+        let anchors_after_c1 = eng.get_anchors().len();
+
+        // Chunk 2: film 75-100s, covers group B shifted +2s
+        // Absolute speech: 82-85s, 87-90s, 92-95s
+        // Relative to chunk start (75s): 7-10s, 12-15s, 17-20s
+        let pcm2 = make_speech_pcm(
+            16000,
+            &[(7000, 10000), (12000, 15000), (17000, 20000)],
+            25000,
+        );
+        let _changes2 = eng.ingest_chunk(pcm2, 16000, 75000, 100000).unwrap();
+
+        // Chunk 2 should also produce changes or anchors
+        // (it may produce changes even if no new anchors, via recompute)
+        let anchors_after_c2 = eng.get_anchors().len();
+        assert!(
+            anchors_after_c2 >= anchors_after_c1,
+            "chunk 2 should add anchors (had {}, now {})",
+            anchors_after_c1,
+            anchors_after_c2,
+        );
+
+        // At least one chunk stored
+        assert!(
+            !eng.get_chunk_history().is_empty(),
+            "should have at least 1 chunk stored"
+        );
+
+        // All 6 lines should have corrected times ~+2000ms
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..6 {
+            let orig_start = sub.original_timespans[i].0;
+            assert_within(
+                sub.corrected_start_ms[i],
+                orig_start + 2000,
+                1500,
+                &format!("line {} corrected start", i),
+            );
+        }
+    }
+
+    // -- e2e: reset mid-session ---------------------------------------------
+
+    #[test]
+    fn e2e_reset_mid_session() {
+        let mut eng = make_engine();
+        load_sample(&mut eng);
+
+        // Phase 1: align with +3s offset
+        let pcm1 = make_speech_pcm(
+            16000,
+            &[
+                (4000, 7000),
+                (8000, 11000),
+                (13000, 16000),
+                (23000, 26000),
+                (33000, 36000),
+            ],
+            40000,
+        );
+        let changes1 = eng.ingest_chunk(pcm1, 16000, 0, 40000).unwrap();
+        assert!(!changes1.is_empty(), "phase 1 should produce changes");
+        assert!(!eng.get_anchors().is_empty(), "phase 1 should have anchors");
+
+        // Phase 2: reset
+        eng.reset();
+        assert!(eng.get_anchors().is_empty(), "reset should clear anchors");
+        assert!(
+            eng.get_chunk_history().is_empty(),
+            "reset should clear chunks"
+        );
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..5 {
+            assert_eq!(
+                sub.corrected_start_ms[i], sub.original_timespans[i].0,
+                "reset should restore original start for line {}",
+                i
+            );
+            assert_eq!(
+                sub.corrected_end_ms[i], sub.original_timespans[i].1,
+                "reset should restore original end for line {}",
+                i
+            );
+        }
+
+        // Phase 3: re-align with +5s offset
+        let pcm2 = make_speech_pcm(
+            16000,
+            &[
+                (6000, 9000),
+                (10000, 13000),
+                (15000, 18000),
+                (25000, 28000),
+                (35000, 38000),
+            ],
+            40000,
+        );
+        let changes2 = eng.ingest_chunk(pcm2, 16000, 0, 40000).unwrap();
+        assert!(!changes2.is_empty(), "phase 3 should produce changes");
+
+        // Should reflect +5s, not +3s from phase 1
+        for c in &changes2 {
+            assert_within(
+                c.new_start_ms - c.old_start_ms,
+                5000,
+                1500,
+                &format!("phase 3 line {} delta", c.line_index),
+            );
+        }
+
+        // Only 1 chunk in history (not 2)
+        assert_eq!(eng.get_chunk_history().len(), 1);
+    }
+
+    // -- e2e: split detection -----------------------------------------------
+
+    #[test]
+    fn e2e_split_detection() {
+        let mut eng = make_engine();
+
+        // Custom SRT with large gap between groups to make split clear
+        let srt = make_srt(&[
+            (5000, 8000, "Early A"),
+            (10000, 13000, "Early B"),
+            (30000, 33000, "Late A"),
+            (35000, 38000, "Late B"),
+        ]);
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // Lines 0-1 shifted +2s: speech at 7-10s, 12-15s
+        // Lines 2-3 shifted -3s: speech at 27-30s, 32-35s
+        let pcm = make_speech_pcm(
+            16000,
+            &[
+                (7000, 10000),
+                (12000, 15000),
+                (27000, 30000),
+                (32000, 35000),
+            ],
+            50000,
+        );
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 50000).unwrap();
+        assert!(!changes.is_empty(), "should produce changes");
+
+        let anchors = eng.get_anchors();
+        assert!(
+            anchors.len() >= 2,
+            "should have at least 2 anchors for split, got {}",
+            anchors.len()
+        );
+
+        // Find anchors for each region
+        let early_anchor = anchors
+            .iter()
+            .find(|a| a.film_position_ms < 20000)
+            .expect("should have anchor for early region");
+        let late_anchor = anchors
+            .iter()
+            .find(|a| a.film_position_ms > 20000)
+            .expect("should have anchor for late region");
+
+        assert_within(early_anchor.delta_ms, 2000, 1500, "early anchor delta");
+        assert_within(late_anchor.delta_ms, -3000, 1500, "late anchor delta");
+
+        // Lines 0-1 should be shifted ~+2000
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..2 {
+            assert_within(
+                sub.corrected_start_ms[i] - sub.original_timespans[i].0,
+                2000,
+                1500,
+                &format!("early line {} delta", i),
+            );
+        }
+        // Lines 2-3 should be shifted ~-3000
+        for i in 2..4 {
+            assert_within(
+                sub.corrected_start_ms[i] - sub.original_timespans[i].0,
+                -3000,
+                1500,
+                &format!("late line {} delta", i),
+            );
+        }
     }
 }
