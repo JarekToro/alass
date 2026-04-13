@@ -343,7 +343,7 @@ impl AlignmentEngine {
         }
 
         // ── 1. STITCH CHECK ──────────────────────────────────────────────
-        let (eff_pcm, eff_start, eff_end) =
+        let (eff_pcm, eff_start, eff_end, stitch_evicted) =
             self.stitch_check(pcm_data, film_start_ms, film_end_ms, sample_rate);
 
         // ── 2. VAD ───────────────────────────────────────────────────────
@@ -387,9 +387,12 @@ impl AlignmentEngine {
 
         // ── 6. QUALITY GATE ─────────────────────────────────────────────
         if score < self.config.quality_threshold {
-            let changes = self.recompute_all_and_diff();
-            self.broadcast_changes(&changes);
-            return Ok(changes);
+            if stitch_evicted {
+                let changes = self.recompute_all_and_diff();
+                self.broadcast_changes(&changes);
+                return Ok(changes);
+            }
+            return Ok(Vec::new());
         }
 
         // ── 7. EXTRACT ANCHORS ──────────────────────────────────────────
@@ -405,10 +408,13 @@ impl AlignmentEngine {
         let resolution = self.resolve_conflicts(&new_anchors);
         match resolution {
             None => {
-                // Chunk loses — discard its anchors, recompute from remaining
-                let changes = self.recompute_all_and_diff();
-                self.broadcast_changes(&changes);
-                Ok(changes)
+                // Chunk loses — only recompute if stitch evicted anchors
+                if stitch_evicted {
+                    let changes = self.recompute_all_and_diff();
+                    self.broadcast_changes(&changes);
+                    return Ok(changes);
+                }
+                Ok(Vec::new())
             }
             Some(ids_to_remove) => {
                 // Remove conflicting existing anchors
@@ -447,13 +453,16 @@ impl AlignmentEngine {
     // -----------------------------------------------------------------------
 
     /// Step 1: scan chunk history for adjacent/overlapping chunks, merge PCM.
+    /// Returns `(pcm, start, end, anchors_evicted)`.
     fn stitch_check(
         &mut self,
         mut pcm: Vec<u8>,
         mut start: i64,
         mut end: i64,
         sample_rate: i32,
-    ) -> (Vec<u8>, i64, i64) {
+    ) -> (Vec<u8>, i64, i64, bool) {
+        let mut evicted_any = false;
+
         loop {
             let tol = self.config.stitch_tolerance_ms;
             let found = self.chunks.iter().position(|c| {
@@ -470,9 +479,12 @@ impl AlignmentEngine {
                 Some(idx) => {
                     let chunk = self.chunks.remove(idx);
                     // Evict old chunk's anchors
-                    let evict: HashSet<Uuid> =
-                        chunk.anchor_ids.iter().copied().collect();
-                    self.anchors.retain(|a| !evict.contains(&a.id));
+                    if !chunk.anchor_ids.is_empty() {
+                        let evict: HashSet<Uuid> =
+                            chunk.anchor_ids.iter().copied().collect();
+                        self.anchors.retain(|a| !evict.contains(&a.id));
+                        evicted_any = true;
+                    }
 
                     // Merge PCM in time order
                     if chunk.film_start_ms <= start {
@@ -503,7 +515,7 @@ impl AlignmentEngine {
             }
         }
 
-        (pcm, start, end)
+        (pcm, start, end, evicted_any)
     }
 
     /// Extract alass-core TimeSpans for subtitle lines whose original timing
@@ -1269,7 +1281,7 @@ Fifth line
 
         // New chunk starting at 5000ms (within tolerance)
         let new_pcm = vec![5, 6, 7, 8];
-        let (merged, start, end) = eng.stitch_check(new_pcm, 5000, 10000, 16000);
+        let (merged, start, end, _) = eng.stitch_check(new_pcm, 5000, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 10000);
@@ -1296,7 +1308,7 @@ Fifth line
 
         // New chunk ending at 10000ms
         let new_pcm = vec![1, 2, 3, 4];
-        let (merged, start, end) = eng.stitch_check(new_pcm, 0, 10000, 16000);
+        let (merged, start, end, _) = eng.stitch_check(new_pcm, 0, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 20000);
@@ -1329,7 +1341,8 @@ Fifth line
             anchor_ids: vec![anchor_id],
         });
 
-        let _ = eng.stitch_check(vec![0; 4], 5000, 10000, 16000);
+        let (_, _, _, evicted) = eng.stitch_check(vec![0; 4], 5000, 10000, 16000);
+        assert!(evicted, "stitch must report anchor eviction");
 
         assert!(eng.anchors.is_empty(), "stitched chunk's anchors must be evicted");
     }
@@ -1358,7 +1371,7 @@ Fifth line
         });
 
         // New chunk fills the gap [5000–10000]
-        let (_, start, end) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
+        let (_, start, end, _) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 15000);
@@ -1379,7 +1392,8 @@ Fifth line
             anchor_ids: vec![],
         });
 
-        let (pcm, start, end) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
+        let (pcm, start, end, evicted) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
+        assert!(!evicted, "no anchors to evict");
         assert_eq!(start, 5000);
         assert_eq!(end, 10000);
         assert_eq!(pcm, vec![3, 4]);
