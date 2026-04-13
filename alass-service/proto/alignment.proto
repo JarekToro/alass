@@ -95,14 +95,15 @@ message SrtFile {
 }
 
 message EngineConfig {
-  float  quality_threshold     = 1;  // min nosplit score to accept a chunk
-  int32  split_penalty         = 2;  // alass split_penalty, default 7
-  int32  min_anchor_spacing_ms = 3;  // default 30_000
-  int32  max_drift_ms          = 4;  // coarse sweep half-width, default 30_000
-  int32  split_threshold_ms    = 5;  // delta jump to split anchor groups, default 500
-  int32  sweep_step_ms         = 6;  // coarse sweep step size, default 1_000
-  int32  coverage_buffer_ms    = 7;  // subtitle window buffer, default 10_000
-  int32  stitch_tolerance_ms   = 8;  // chunk adjacency tolerance, default 5_000
+  optional float  quality_threshold     = 1;  // min nosplit score to accept a chunk
+  optional int32  split_penalty         = 2;  // alass split_penalty, default 7
+  optional int32  min_anchor_spacing_ms = 3;  // default 30_000
+  optional int32  max_drift_ms          = 4;  // coarse sweep half-width, default 30_000
+  optional int32  split_threshold_ms    = 5;  // delta jump to split anchor groups, default 500
+  optional int32  sweep_step_ms         = 6;  // coarse sweep step size, default 1_000
+  optional int32  coverage_buffer_ms    = 7;  // subtitle window buffer, default 10_000
+  optional int32  stitch_tolerance_ms   = 8;  // chunk adjacency tolerance, default 5_000
+  optional int32  vad_mode              = 9;  // WebRTC VAD aggressiveness 0-3, default 0
 }
 
 message Empty {}
