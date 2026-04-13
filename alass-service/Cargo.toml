@@ -1,0 +1,24 @@
+[package]
+name = "alass-service"
+version = "0.1.0"
+edition = "2021"
+description = "Alass Alignment Service — gRPC subtitle timing correction"
+license = "GPL-3.0"
+
+[[bin]]
+name = "alass-service"
+path = "src/main.rs"
+
+[dependencies]
+alass-core = { version = "2.0.0", path = "../alass-core" }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+webrtc-vad = "0.4.0"
+subparse = "0.7.0"
+uuid = { version = "1", features = ["v4"] }
+encoding_rs = "0.8"
+
+[build-dependencies]
+tonic-build = "0.12"
