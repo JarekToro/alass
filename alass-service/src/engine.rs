@@ -2179,4 +2179,206 @@ Fifth line
             );
         }
     }
+
+    // -- e2e: streaming stress test -----------------------------------------
+
+    /// Simple deterministic LCG PRNG to avoid adding a rand dependency.
+    struct SimpleRng(u64);
+    impl SimpleRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        /// Returns a value in [0, bound).
+        fn next_range(&mut self, bound: u64) -> u64 {
+            // LCG parameters from Numerical Recipes
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) ^ (self.0 >> 17)) % bound
+        }
+        /// Returns a value in [lo, hi] inclusive.
+        fn range_inclusive(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + self.next_range((hi - lo + 1) as u64) as i64
+        }
+    }
+
+    #[test]
+    fn e2e_streaming_5min_random_chunks() {
+        // -----------------------------------------------------------
+        // Setup: 5-minute film with 20 subtitle lines, constant +3s offset
+        // -----------------------------------------------------------
+        let offset_ms: i64 = 3000;
+        let film_duration_ms: i64 = 300_000; // 5 minutes
+
+        // Generate 20 subtitle lines spread across the 5-minute range.
+        // Each line is 3s long with ~12s spacing.
+        let mut sub_segments: Vec<(i64, i64, &str)> = Vec::new();
+        let texts = [
+            "Line A", "Line B", "Line C", "Line D", "Line E",
+            "Line F", "Line G", "Line H", "Line I", "Line J",
+            "Line K", "Line L", "Line M", "Line N", "Line O",
+            "Line P", "Line Q", "Line R", "Line S", "Line T",
+        ];
+        for (i, text) in texts.iter().enumerate() {
+            let start = 5000 + (i as i64) * 14500; // ~14.5s apart
+            let end = start + 3000;
+            sub_segments.push((start, end, text));
+        }
+        // Last line ends at 5000 + 19*14500 + 3000 = 283500ms (within 300s)
+
+        let srt = make_srt(&sub_segments);
+
+        let mut eng = make_engine();
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // -----------------------------------------------------------
+        // Generate random chunks spanning the 5-minute range
+        // -----------------------------------------------------------
+        let mut rng = SimpleRng::new(42); // fixed seed for reproducibility
+
+        // Build chunks: start near 0, advance with random-sized chunks
+        // and random gaps (positive = gap, negative = overlap)
+        let mut chunks: Vec<(i64, i64)> = Vec::new();
+        let mut cursor: i64 = 0;
+
+        while cursor < film_duration_ms {
+            let chunk_len = rng.range_inclusive(10_000, 30_000); // 10-30s
+            let chunk_start = cursor;
+            let chunk_end = (chunk_start + chunk_len).min(film_duration_ms);
+            chunks.push((chunk_start, chunk_end));
+
+            // Random gap/overlap: -5s to +10s
+            let gap = rng.range_inclusive(-5000, 10000);
+            cursor = chunk_end + gap;
+            if cursor < chunk_start + 1000 {
+                // Don't go backwards too far — keep some forward progress
+                cursor = chunk_end + 1000;
+            }
+        }
+
+        let num_chunks = chunks.len();
+
+        // -----------------------------------------------------------
+        // For each chunk, generate PCM with speech matching the
+        // subtitle lines that fall within the chunk's time range,
+        // shifted by the offset.
+        // -----------------------------------------------------------
+        let mut total_changes: Vec<proto::LineChange> = Vec::new();
+        let mut ingest_errors = 0;
+
+        eprintln!("--- Streaming {} chunks over {}ms ---", num_chunks, film_duration_ms);
+
+        for (ci, &(chunk_start, chunk_end)) in chunks.iter().enumerate() {
+            let chunk_duration = chunk_end - chunk_start;
+
+            // Find subtitle lines whose offset-shifted position overlaps this chunk
+            let mut speech_segments: Vec<(i64, i64)> = Vec::new();
+            for &(sub_start, sub_end, _) in &sub_segments {
+                // The "true" audio position of this line is sub timing + offset
+                let audio_start = sub_start + offset_ms;
+                let audio_end = sub_end + offset_ms;
+
+                // Clip to chunk boundaries
+                if audio_end > chunk_start && audio_start < chunk_end {
+                    let seg_start = (audio_start - chunk_start).max(0);
+                    let seg_end = (audio_end - chunk_start).min(chunk_duration);
+                    if seg_end > seg_start {
+                        speech_segments.push((seg_start, seg_end));
+                    }
+                }
+            }
+
+            let pcm = make_speech_pcm(16000, &speech_segments, chunk_duration);
+
+            eprintln!(
+                "  chunk {:2}/{}: film {:6}-{:6}ms ({:5}ms), {} speech segments",
+                ci + 1,
+                num_chunks,
+                chunk_start,
+                chunk_end,
+                chunk_duration,
+                speech_segments.len(),
+            );
+
+            match eng.ingest_chunk(pcm, 16000, chunk_start, chunk_end) {
+                Ok(changes) => {
+                    if !changes.is_empty() {
+                        eprintln!("           → {} line changes", changes.len());
+                        total_changes.extend(changes);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("           → ERROR: {}", e);
+                    ingest_errors += 1;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Assertions
+        // -----------------------------------------------------------
+        assert_eq!(ingest_errors, 0, "no ingest errors should occur");
+
+        let anchors = eng.get_anchors();
+        eprintln!(
+            "\n--- Results: {} anchors, {} total line-change events ---",
+            anchors.len(),
+            total_changes.len(),
+        );
+
+        // Must have produced at least some anchors
+        assert!(
+            !anchors.is_empty(),
+            "streaming should have produced at least 1 anchor"
+        );
+
+        // Check that the final corrected times are close to the expected offset
+        let sub = eng.subtitle.as_ref().unwrap();
+        let num_lines = sub.original_timespans.len();
+        let mut correct_count = 0;
+        let tolerance = 2000; // 2s tolerance for streaming with gaps/overlaps
+
+        eprintln!("\n--- Per-line results (expected delta = {}ms) ---", offset_ms);
+        for i in 0..num_lines {
+            let orig = sub.original_timespans[i].0;
+            let corrected = sub.corrected_start_ms[i];
+            let actual_delta = corrected - orig;
+            let close = (actual_delta - offset_ms).abs() <= tolerance;
+            if close {
+                correct_count += 1;
+            }
+            eprintln!(
+                "  line {:2}: orig={:6}ms, corrected={:6}ms, delta={:+6}ms {}",
+                i, orig, corrected, actual_delta,
+                if close { "OK" } else { "MISS" },
+            );
+        }
+
+        eprintln!(
+            "\n--- {}/{} lines within {}ms of expected delta ---",
+            correct_count, num_lines, tolerance,
+        );
+
+        // At least 75% of lines should be correctly aligned
+        let required = (num_lines * 3) / 4;
+        assert!(
+            correct_count >= required,
+            "expected at least {}/{} lines within {}ms of target delta {}, got {}",
+            required,
+            num_lines,
+            tolerance,
+            offset_ms,
+            correct_count,
+        );
+
+        // Verify the exported SRT is parseable and non-empty
+        let srt_out = eng.export_srt().unwrap();
+        assert!(!srt_out.is_empty(), "exported SRT should not be empty");
+
+        // Verify chunk history exists
+        assert!(
+            !eng.get_chunk_history().is_empty(),
+            "should have chunk history",
+        );
+
+        eprintln!("\n--- PASS ---");
+    }
 }
