@@ -379,9 +379,27 @@ impl AlignmentEngine {
         let (eff_pcm, eff_start, eff_end, stitch_evicted) =
             self.stitch_check(pcm_data, film_start_ms, film_end_ms, sample_rate);
 
+        #[cfg(test)]
+        eprintln!(
+            "    [1 STITCH] input={}-{}ms → eff={}-{}ms ({}ms), evicted={}, chunks_remaining={}",
+            film_start_ms, film_end_ms, eff_start, eff_end,
+            eff_end - eff_start, stitch_evicted, self.chunks.len(),
+        );
+
         // ── 2. VAD ───────────────────────────────────────────────────────
         let vad_spans = vad::run_vad(&eff_pcm, sample_rate, eff_start, self.config.vad_mode);
+
+        #[cfg(test)]
+        {
+            eprintln!("    [2 VAD] {} spans", vad_spans.len());
+            for (vi, vs) in vad_spans.iter().enumerate() {
+                eprintln!("       vad[{}]: {}-{}ms", vi, i64::from(vs.start), i64::from(vs.end));
+            }
+        }
+
         if vad_spans.is_empty() {
+            #[cfg(test)]
+            eprintln!("    → EXIT: no VAD spans");
             return Ok(Vec::new());
         }
 
@@ -396,6 +414,12 @@ impl AlignmentEngine {
             self.coarse_sweep(&vad_spans, &broad_window)
         };
 
+        #[cfg(test)]
+        eprintln!(
+            "    [3 COARSE] broad_window={} subs in [{}, {}], coarse_delta={}, score={:.4}",
+            broad_window.len(), broad_start, broad_end, coarse_delta, _coarse_score,
+        );
+
         // ── 4. EXTRACT SUBTITLE WINDOW ──────────────────────────────────
         let win_start = eff_start - self.config.max_drift_ms + coarse_delta
             - self.config.coverage_buffer_ms;
@@ -404,7 +428,15 @@ impl AlignmentEngine {
         let (window_spans, window_indices) =
             self.subtitle_window_with_indices(win_start, win_end);
 
+        #[cfg(test)]
+        eprintln!(
+            "    [4 WINDOW] [{}, {}] → {} subs, indices={:?}",
+            win_start, win_end, window_spans.len(), window_indices,
+        );
+
         if window_spans.is_empty() {
+            #[cfg(test)]
+            eprintln!("    → EXIT: empty subtitle window");
             return Ok(Vec::new());
         }
 
@@ -418,8 +450,19 @@ impl AlignmentEngine {
             NoProgressHandler,
         );
 
+        #[cfg(test)]
+        {
+            eprintln!("    [5 ALIGN] score={:.4}, {} deltas", score, deltas.len());
+            for (di, d) in deltas.iter().enumerate() {
+                eprintln!("       delta[{}] (line {}): {:+}ms", di, window_indices[di], d.as_i64());
+            }
+        }
+
         // ── 6. QUALITY GATE ─────────────────────────────────────────────
         if score < self.config.quality_threshold {
+            #[cfg(test)]
+            eprintln!("    → EXIT: quality gate ({:.4} < {:.4}), stitch_evicted={}",
+                score, self.config.quality_threshold, stitch_evicted);
             if stitch_evicted {
                 let changes = self.recompute_all_and_diff();
                 self.broadcast_changes(&changes);
@@ -433,16 +476,36 @@ impl AlignmentEngine {
         let new_anchors =
             self.extract_anchors(&deltas, &window_indices, score, chunk_id);
 
+        #[cfg(test)]
+        {
+            eprintln!("    [7 ANCHORS] {} new anchors", new_anchors.len());
+            for a in &new_anchors {
+                eprintln!("       anchor: pos={}ms, delta={:+}ms, conf={:.4}, lines={}-{}",
+                    a.film_position_ms, a.delta_ms, a.confidence, a.line_start, a.line_end);
+            }
+        }
+
         if new_anchors.is_empty() {
+            #[cfg(test)]
+            eprintln!("    → EXIT: no anchors extracted");
             return Ok(Vec::new());
         }
 
         // ── 8. CONFLICT RESOLUTION ──────────────────────────────────────
         let resolution = self.resolve_conflicts(&new_anchors);
+
+        #[cfg(test)]
+        eprintln!("    [8 CONFLICT] resolution={}", match &resolution {
+            None => "LOST (chunk rejected)".to_string(),
+            Some(ids) => format!("WON (evicting {} old anchors)", ids.len()),
+        });
+
         match resolution {
             None => {
                 // Chunk loses — only recompute if stitch evicted anchors
                 if stitch_evicted {
+                    #[cfg(test)]
+                    eprintln!("    → recomputing after stitch eviction despite conflict loss");
                     let changes = self.recompute_all_and_diff();
                     self.broadcast_changes(&changes);
                     return Ok(changes);
@@ -515,6 +578,14 @@ impl AlignmentEngine {
                 None => break,
                 Some(idx) => {
                     let chunk = self.chunks.remove(idx);
+
+                    #[cfg(test)]
+                    eprintln!(
+                        "    [STITCH] merging stored chunk {}-{}ms ({} anchor_ids) into {}-{}ms",
+                        chunk.film_start_ms, chunk.film_end_ms,
+                        chunk.anchor_ids.len(), start, end,
+                    );
+
                     // Evict old chunk's anchors
                     if !chunk.anchor_ids.is_empty() {
                         let evict: HashSet<Uuid> =
