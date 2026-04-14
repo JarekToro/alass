@@ -97,6 +97,30 @@ impl From<&EngineConfig> for proto::EngineConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+/// Merge abutting or overlapping time spans in place.  Two spans are merged
+/// if the gap between them is `<= tolerance_ms`.  Assumes input is sorted
+/// by start time (stitch_check sorts before calling this).
+fn merge_adjacent_spans(spans: &mut Vec<TimeSpan>, tolerance_ms: i64) {
+    if spans.len() < 2 {
+        return;
+    }
+    let mut merged: Vec<TimeSpan> = Vec::with_capacity(spans.len());
+    for s in spans.drain(..) {
+        match merged.last_mut() {
+            Some(last) if i64::from(s.start) <= i64::from(last.end) + tolerance_ms => {
+                let new_end = i64::from(last.end).max(i64::from(s.end));
+                *last = TimeSpan::new(last.start, TimePoint::from(new_end));
+            }
+            _ => merged.push(s),
+        }
+    }
+    *spans = merged;
+}
+
+// ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
 
@@ -116,7 +140,12 @@ struct ProcessedChunk {
     id: Uuid,
     film_start_ms: i64,
     film_end_ms: i64,
-    pcm_data: Vec<u8>, // raw 16-bit LE PCM bytes
+    /// Speech spans detected by VAD, with absolute film-time coordinates.
+    /// Stored instead of raw PCM because downstream pipeline only ever
+    /// consumes VAD output — this cuts per-chunk memory by ~500x and
+    /// lets stitching merge speech spans directly without padding gaps
+    /// with zero bytes or re-running VAD.
+    vad_spans: Vec<TimeSpan>,
     sample_rate: i32,
     anchor_ids: Vec<Uuid>,
 }
@@ -375,27 +404,38 @@ impl AlignmentEngine {
             return Err("sample_rate must be 8000 or 16000".into());
         }
 
-        // ── 1. STITCH CHECK ──────────────────────────────────────────────
-        let (eff_pcm, eff_start, eff_end, stitch_evicted) =
-            self.stitch_check(pcm_data, film_start_ms, film_end_ms, sample_rate);
-
-        #[cfg(test)]
-        eprintln!(
-            "    [1 STITCH] input={}-{}ms → eff={}-{}ms ({}ms), evicted={}, chunks_remaining={}",
-            film_start_ms, film_end_ms, eff_start, eff_end,
-            eff_end - eff_start, stitch_evicted, self.chunks.len(),
-        );
-
-        // ── 2. VAD ───────────────────────────────────────────────────────
-        let vad_spans = vad::run_vad(&eff_pcm, sample_rate, eff_start, self.config.vad_mode);
+        // ── 1. VAD ───────────────────────────────────────────────────────
+        // Run VAD on the fresh PCM immediately.  PCM is dropped at end of
+        // scope — only the VAD spans survive into the rest of the pipeline.
+        let fresh_spans =
+            vad::run_vad(&pcm_data, sample_rate, film_start_ms, self.config.vad_mode);
 
         #[cfg(test)]
         {
-            eprintln!("    [2 VAD] {} spans", vad_spans.len());
-            for (vi, vs) in vad_spans.iter().enumerate() {
+            eprintln!("    [1 VAD] {} fresh spans from {}-{}ms",
+                fresh_spans.len(), film_start_ms, film_end_ms);
+            for (vi, vs) in fresh_spans.iter().enumerate() {
                 eprintln!("       vad[{}]: {}-{}ms", vi, i64::from(vs.start), i64::from(vs.end));
             }
         }
+
+        // ── 2. STITCH CHECK ──────────────────────────────────────────────
+        // Fold adjacent/overlapping stored chunks into this chunk's VAD
+        // spans.  Evicts any anchors that were pinned to the consumed
+        // chunks.
+        let (mut vad_spans, eff_start, eff_end, stitch_evicted) =
+            self.stitch_check(fresh_spans, film_start_ms, film_end_ms, sample_rate);
+
+        // Merge abutting/overlapping spans (handles speech that spanned
+        // a chunk boundary and was therefore split across two VAD runs).
+        merge_adjacent_spans(&mut vad_spans, 20);
+
+        #[cfg(test)]
+        eprintln!(
+            "    [2 STITCH] eff={}-{}ms ({}ms), evicted={}, total_spans={}, chunks_remaining={}",
+            eff_start, eff_end, eff_end - eff_start,
+            stitch_evicted, vad_spans.len(), self.chunks.len(),
+        );
 
         if vad_spans.is_empty() {
             #[cfg(test)]
@@ -527,14 +567,14 @@ impl AlignmentEngine {
                 }
 
                 // ── 10. STORE CHUNK ──────────────────────────────────────
-                // PCM data is not retained — it was only needed for
-                // stitching during this ingest call.  Dropping it avoids
-                // unbounded memory growth for long sessions.
+                // Retain VAD spans (cheap: ~16 bytes per span) so future
+                // adjacent/overlapping chunks can stitch against real
+                // speech data instead of zero-padded PCM.
                 self.chunks.push(ProcessedChunk {
                     id: chunk_id,
                     film_start_ms: eff_start,
                     film_end_ms: eff_end,
-                    pcm_data: Vec::new(),
+                    vad_spans,
                     sample_rate,
                     anchor_ids,
                 });
@@ -551,15 +591,17 @@ impl AlignmentEngine {
     // Pipeline helpers
     // -----------------------------------------------------------------------
 
-    /// Step 1: scan chunk history for adjacent/overlapping chunks, merge PCM.
-    /// Returns `(pcm, start, end, anchors_evicted)`.
+    /// Step 2: scan chunk history for adjacent/overlapping chunks, merge
+    /// their VAD spans into this chunk's spans.  Returns the combined
+    /// spans (sorted by start time), the expanded time window, and a flag
+    /// indicating whether any anchors were evicted.
     fn stitch_check(
         &mut self,
-        mut pcm: Vec<u8>,
+        mut vad_spans: Vec<TimeSpan>,
         mut start: i64,
         mut end: i64,
         sample_rate: i32,
-    ) -> (Vec<u8>, i64, i64, bool) {
+    ) -> (Vec<TimeSpan>, i64, i64, bool) {
         let mut evicted_any = false;
 
         loop {
@@ -581,9 +623,9 @@ impl AlignmentEngine {
 
                     #[cfg(test)]
                     eprintln!(
-                        "    [STITCH] merging stored chunk {}-{}ms ({} anchor_ids) into {}-{}ms",
+                        "    [STITCH] merging stored chunk {}-{}ms ({} vad spans, {} anchor_ids) into {}-{}ms",
                         chunk.film_start_ms, chunk.film_end_ms,
-                        chunk.anchor_ids.len(), start, end,
+                        chunk.vad_spans.len(), chunk.anchor_ids.len(), start, end,
                     );
 
                     // Evict old chunk's anchors
@@ -594,36 +636,18 @@ impl AlignmentEngine {
                         evicted_any = true;
                     }
 
-                    // Merge PCM in time order
-                    if chunk.film_start_ms <= start {
-                        // Old chunk comes first
-                        let gap_ms = start - chunk.film_end_ms;
-                        let gap_samples =
-                            (gap_ms.max(0) * sample_rate as i64 / 1000) as usize;
-                        let gap_bytes = gap_samples * 2;
-
-                        let mut merged = chunk.pcm_data;
-                        merged.resize(merged.len() + gap_bytes, 0u8);
-                        merged.extend_from_slice(&pcm);
-                        pcm = merged;
-                        start = chunk.film_start_ms;
-                    } else {
-                        // Old chunk comes after
-                        let gap_ms = chunk.film_start_ms - end;
-                        let gap_samples =
-                            (gap_ms.max(0) * sample_rate as i64 / 1000) as usize;
-                        let gap_bytes = gap_samples * 2;
-
-                        pcm.resize(pcm.len() + gap_bytes, 0u8);
-                        pcm.extend_from_slice(&chunk.pcm_data);
-                        end = chunk.film_end_ms;
-                    }
+                    // Absolute-time VAD spans can just be concatenated.
+                    // Ordering is restored with a sort at the end.
+                    vad_spans.extend(chunk.vad_spans);
+                    start = start.min(chunk.film_start_ms);
+                    end = end.max(chunk.film_end_ms);
                     // Continue looping (cascade)
                 }
             }
         }
 
-        (pcm, start, end, evicted_any)
+        vad_spans.sort_by_key(|s| i64::from(s.start));
+        (vad_spans, start, end, evicted_any)
     }
 
     /// Extract alass-core TimeSpans for subtitle lines whose original timing
@@ -1108,7 +1132,7 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 10000,
-            pcm_data: vec![],
+            vad_spans: vec![],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
@@ -1441,31 +1465,38 @@ Fifth line
 
     // -- stitch_check -------------------------------------------------------
 
+    fn ts(start_ms: i64, end_ms: i64) -> TimeSpan {
+        TimeSpan::new(TimePoint::from(start_ms), TimePoint::from(end_ms))
+    }
+
     #[test]
     fn stitch_merges_adjacent_after() {
         let mut eng = make_engine();
         load_sample(&mut eng);
 
-        // Pre-existing chunk: 0–5000ms
+        // Pre-existing chunk: 0–5000ms with speech at 1000-2000
         eng.chunks.push(ProcessedChunk {
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![1, 2, 3, 4],
+            vad_spans: vec![ts(1000, 2000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
-        // New chunk starting at 5000ms (within tolerance)
-        let new_pcm = vec![5, 6, 7, 8];
-        let (merged, start, end, _) = eng.stitch_check(new_pcm, 5000, 10000, 16000);
+        // New chunk starting at 5000ms (within tolerance) with speech at 6000-7000
+        let new_spans = vec![ts(6000, 7000)];
+        let (merged, start, end, _) = eng.stitch_check(new_spans, 5000, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 10000);
         assert!(eng.chunks.is_empty()); // old chunk consumed
-        // Merged PCM = old + gap(0) + new
-        assert!(merged.starts_with(&[1, 2, 3, 4]));
-        assert!(merged.ends_with(&[5, 6, 7, 8]));
+        // Merged spans are sorted by start: old first, then new
+        assert_eq!(merged.len(), 2);
+        assert_eq!(i64::from(merged[0].start), 1000);
+        assert_eq!(i64::from(merged[0].end), 2000);
+        assert_eq!(i64::from(merged[1].start), 6000);
+        assert_eq!(i64::from(merged[1].end), 7000);
     }
 
     #[test]
@@ -1473,24 +1504,25 @@ Fifth line
         let mut eng = make_engine();
         load_sample(&mut eng);
 
-        // Pre-existing chunk: 10000–20000ms
+        // Pre-existing chunk: 10000–20000ms with speech at 12000-13000
         eng.chunks.push(ProcessedChunk {
             id: Uuid::new_v4(),
             film_start_ms: 10000,
             film_end_ms: 20000,
-            pcm_data: vec![5, 6, 7, 8],
+            vad_spans: vec![ts(12000, 13000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
-        // New chunk ending at 10000ms
-        let new_pcm = vec![1, 2, 3, 4];
-        let (merged, start, end, _) = eng.stitch_check(new_pcm, 0, 10000, 16000);
+        // New chunk ending at 10000ms with speech at 3000-4000
+        let new_spans = vec![ts(3000, 4000)];
+        let (merged, start, end, _) = eng.stitch_check(new_spans, 0, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 20000);
-        assert!(merged.starts_with(&[1, 2, 3, 4]));
-        assert!(merged.ends_with(&[5, 6, 7, 8]));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(i64::from(merged[0].start), 3000);
+        assert_eq!(i64::from(merged[1].start), 12000);
     }
 
     #[test]
@@ -1513,12 +1545,12 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![0; 4],
+            vad_spans: vec![],
             sample_rate: 16000,
             anchor_ids: vec![anchor_id],
         });
 
-        let (_, _, _, evicted) = eng.stitch_check(vec![0; 4], 5000, 10000, 16000);
+        let (_, _, _, evicted) = eng.stitch_check(vec![], 5000, 10000, 16000);
         assert!(evicted, "stitch must report anchor eviction");
 
         assert!(eng.anchors.is_empty(), "stitched chunk's anchors must be evicted");
@@ -1534,7 +1566,7 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![1, 2],
+            vad_spans: vec![ts(1000, 2000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
@@ -1542,17 +1574,23 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 10000,
             film_end_ms: 15000,
-            pcm_data: vec![5, 6],
+            vad_spans: vec![ts(12000, 13000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
-        // New chunk fills the gap [5000–10000]
-        let (_, start, end, _) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
+        // New chunk fills the gap [5000–10000] with speech at 6000-7000
+        let (merged, start, end, _) =
+            eng.stitch_check(vec![ts(6000, 7000)], 5000, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 15000);
         assert!(eng.chunks.is_empty(), "both old chunks consumed via cascade");
+        // All three spans survive, sorted
+        assert_eq!(merged.len(), 3);
+        assert_eq!(i64::from(merged[0].start), 1000);
+        assert_eq!(i64::from(merged[1].start), 6000);
+        assert_eq!(i64::from(merged[2].start), 12000);
     }
 
     #[test]
@@ -1564,16 +1602,19 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![1, 2],
+            vad_spans: vec![ts(1000, 2000)],
             sample_rate: 8000, // different from incoming 16000
             anchor_ids: vec![],
         });
 
-        let (pcm, start, end, evicted) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
+        let new_spans = vec![ts(6000, 7000)];
+        let (spans, start, end, evicted) =
+            eng.stitch_check(new_spans, 5000, 10000, 16000);
         assert!(!evicted, "no anchors to evict");
         assert_eq!(start, 5000);
         assert_eq!(end, 10000);
-        assert_eq!(pcm, vec![3, 4]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(i64::from(spans[0].start), 6000);
         assert_eq!(eng.chunks.len(), 1); // old chunk untouched
     }
 
@@ -1821,18 +1862,19 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 10000,
-            pcm_data: vec![1, 2, 3, 4],
+            vad_spans: vec![ts(2000, 3000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
         // New chunk overlaps: 5000–15000ms
-        let new_pcm = vec![5, 6, 7, 8];
-        let (_, start, end, _) = eng.stitch_check(new_pcm, 5000, 15000, 16000);
+        let new_spans = vec![ts(12000, 13000)];
+        let (merged, start, end, _) = eng.stitch_check(new_spans, 5000, 15000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 15000);
         assert!(eng.chunks.is_empty());
+        assert_eq!(merged.len(), 2);
     }
 
     // -- set_config / config() accessor (#9) ----------------------------------
