@@ -444,6 +444,13 @@ impl AlignmentEngine {
         }
 
         // ── 3. COARSE SWEEP ─────────────────────────────────────────────
+        // Global coarse delta computed from all accumulated VAD
+        // evidence (stored chunks + current).  Used as a tie-break
+        // prior when the local chunk's own evidence is too sparse to
+        // pick a unique winner (e.g. a single speech span that
+        // matches subtitle lines at many candidate shifts).
+        let global_prior = self.compute_global_coarse_delta(&vad_spans);
+
         let broad_start = eff_start - 2 * self.config.max_drift_ms;
         let broad_end = eff_end + 2 * self.config.max_drift_ms;
         let broad_window = self.subtitle_spans_in_range(broad_start, broad_end);
@@ -451,13 +458,14 @@ impl AlignmentEngine {
         let (coarse_delta, _coarse_score) = if broad_window.is_empty() {
             (0i64, 0.0)
         } else {
-            self.coarse_sweep(&vad_spans, &broad_window)
+            self.coarse_sweep(&vad_spans, &broad_window, global_prior)
         };
 
         #[cfg(test)]
         eprintln!(
-            "    [3 COARSE] broad_window={} subs in [{}, {}], coarse_delta={}, score={:.4}",
-            broad_window.len(), broad_start, broad_end, coarse_delta, _coarse_score,
+            "    [3 COARSE] broad_window={} subs in [{}, {}], global_prior={:?}, coarse_delta={}, score={:.4}",
+            broad_window.len(), broad_start, broad_end,
+            global_prior, coarse_delta, _coarse_score,
         );
 
         // ── 4. EXTRACT SUBTITLE WINDOW ──────────────────────────────────
@@ -690,14 +698,30 @@ impl AlignmentEngine {
     }
 
     /// Step 3: coarse sweep — evaluate nosplit score at discrete deltas.
+    ///
+    /// `prior` is the delta preferred on ties (within a small score
+    /// epsilon).  When sparse VAD evidence makes several deltas score
+    /// identically (e.g. 1 speech span matches subtitles at many shifts),
+    /// the tie-break picks the candidate closest to `prior`.  Callers
+    /// can pass the result of `compute_global_coarse_delta` as the prior
+    /// so accumulated timeline-wide evidence pulls the local decision
+    /// toward the globally-consistent answer.  When `prior` is `None`,
+    /// ties resolve to the delta closest to zero (no drift — the Occam
+    /// default).
     fn coarse_sweep(
         &self,
         vad_spans: &[TimeSpan],
         sub_spans: &[TimeSpan],
+        prior: Option<i64>,
     ) -> (i64, f64) {
         let max_d = self.config.max_drift_ms;
         let step = self.config.sweep_step_ms.max(1);
         let steps = max_d / step;
+        let prior = prior.unwrap_or(0);
+        // Score epsilon — two deltas are considered tied if within this.
+        // standard_scoring returns match values in [0, 1] per span so a
+        // few micro-units is safely below any real difference.
+        let eps = 1e-6_f64;
 
         let mut best_delta: i64 = 0;
         let mut best_score: f64 = f64::NEG_INFINITY;
@@ -715,13 +739,69 @@ impl AlignmentEngine {
                 alass_core::standard_scoring,
             );
 
-            if score > best_score {
+            if score > best_score + eps {
                 best_score = score;
                 best_delta = delta;
+            } else if (score - best_score).abs() <= eps {
+                // Tie within epsilon — prefer the delta closer to prior.
+                if (delta - prior).abs() < (best_delta - prior).abs() {
+                    best_delta = delta;
+                }
             }
         }
 
         (best_delta, best_score)
+    }
+
+    /// Run a coarse sweep over *all* accumulated VAD evidence (every
+    /// stored chunk's spans plus the freshly-stitched spans from the
+    /// current ingest) against the entire subtitle track.
+    ///
+    /// As evidence grows across ingests, the set of deltas that
+    /// score-tie narrows — the right answer stays in the tied set,
+    /// while spurious ones drop out once enough VAD spans disagree
+    /// with them.  The returned delta is intended as a tie-break
+    /// prior for the *local* coarse sweep of the current chunk.
+    ///
+    /// Returns `None` when there's insufficient evidence to
+    /// disambiguate (zero or one total VAD spans, or no subtitle
+    /// state loaded).
+    fn compute_global_coarse_delta(
+        &self,
+        current_spans: &[TimeSpan],
+    ) -> Option<i64> {
+        let sub = self.subtitle.as_ref()?;
+
+        // Gather all stored VAD spans + current.  Ordering doesn't
+        // affect get_nosplit_score, but we sort anyway for determinism.
+        let total_stored: usize =
+            self.chunks.iter().map(|c| c.vad_spans.len()).sum();
+        let mut all_spans: Vec<TimeSpan> =
+            Vec::with_capacity(total_stored + current_spans.len());
+        for chunk in &self.chunks {
+            all_spans.extend(chunk.vad_spans.iter().copied());
+        }
+        all_spans.extend(current_spans.iter().copied());
+
+        if all_spans.len() < 2 {
+            return None;
+        }
+        all_spans.sort_by_key(|s| i64::from(s.start));
+
+        let all_subs: Vec<TimeSpan> = sub
+            .original_timespans
+            .iter()
+            .map(|&(s, e)| TimeSpan::new(TimePoint::from(s), TimePoint::from(e)))
+            .collect();
+        if all_subs.is_empty() {
+            return None;
+        }
+
+        // Pass None prior → tie-break prefers delta=0 (no drift).  This
+        // avoids recursion and makes the global sweep a pure function
+        // of evidence.
+        let (delta, _score) = self.coarse_sweep(&all_spans, &all_subs, None);
+        Some(delta)
     }
 
     /// Step 7: group deltas into anchor groups, emit Anchors.
@@ -1783,9 +1863,34 @@ Fifth line
             TimeSpan::new(TimePoint::from(7_000), TimePoint::from(8_000)),
         ];
 
-        let (delta, score) = eng.coarse_sweep(&vad, &subs);
+        let (delta, score) = eng.coarse_sweep(&vad, &subs, None);
         assert_eq!(delta, 5000);
         assert!(score > 0.0);
+    }
+
+    #[test]
+    fn coarse_sweep_prior_tie_break() {
+        let eng = make_engine();
+
+        // Single VAD span — highly ambiguous.  Many deltas tie.
+        let vad = vec![TimeSpan::new(
+            TimePoint::from(10_000),
+            TimePoint::from(11_000),
+        )];
+        // Subtitle at 7s–8s: delta +3000 matches.  Subtitle at 20s–21s:
+        // delta -10000 also matches.  Both score identically.
+        let subs = vec![
+            TimeSpan::new(TimePoint::from(7_000), TimePoint::from(8_000)),
+            TimeSpan::new(TimePoint::from(20_000), TimePoint::from(21_000)),
+        ];
+
+        // With no prior, the tie resolves to the delta closest to 0.
+        let (d_no_prior, _) = eng.coarse_sweep(&vad, &subs, None);
+        assert_eq!(d_no_prior, 3000);
+
+        // With a strong prior near -10000, the tie resolves the other way.
+        let (d_biased, _) = eng.coarse_sweep(&vad, &subs, Some(-10_000));
+        assert_eq!(d_biased, -10_000);
     }
 
     // -- nearest_anchor_confidence ------------------------------------------
