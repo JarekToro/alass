@@ -1,0 +1,12 @@
+[package]
+name = "alass-stream"
+version = "0.1.0"
+edition = "2021"
+description = "Streaming subtitle alignment built on alass-core. Accumulates VAD evidence from timestamped audio chunks and re-runs alass alignment against the full original subtitle timeline on every ingest."
+license = "GPL-3.0"
+
+[dependencies]
+alass-core = { version = "2.0.0", path = "../alass-core" }
+webrtc-vad = "0.4.0"
+subparse = "0.7.0"
+encoding_rs = "0.8"

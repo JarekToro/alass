@@ -2,7 +2,8 @@
 
 members = [
     "alass-core",
-    "alass-cli"
+    "alass-cli",
+    "alass-stream"
 ]
 
 [profile.release]
