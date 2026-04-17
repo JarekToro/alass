@@ -97,6 +97,30 @@ impl From<&EngineConfig> for proto::EngineConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+/// Merge abutting or overlapping time spans in place.  Two spans are merged
+/// if the gap between them is `<= tolerance_ms`.  Assumes input is sorted
+/// by start time (stitch_check sorts before calling this).
+fn merge_adjacent_spans(spans: &mut Vec<TimeSpan>, tolerance_ms: i64) {
+    if spans.len() < 2 {
+        return;
+    }
+    let mut merged: Vec<TimeSpan> = Vec::with_capacity(spans.len());
+    for s in spans.drain(..) {
+        match merged.last_mut() {
+            Some(last) if i64::from(s.start) <= i64::from(last.end) + tolerance_ms => {
+                let new_end = i64::from(last.end).max(i64::from(s.end));
+                *last = TimeSpan::new(last.start, TimePoint::from(new_end));
+            }
+            _ => merged.push(s),
+        }
+    }
+    *spans = merged;
+}
+
+// ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
 
@@ -116,7 +140,12 @@ struct ProcessedChunk {
     id: Uuid,
     film_start_ms: i64,
     film_end_ms: i64,
-    pcm_data: Vec<u8>, // raw 16-bit LE PCM bytes
+    /// Speech spans detected by VAD, with absolute film-time coordinates.
+    /// Stored instead of raw PCM because downstream pipeline only ever
+    /// consumes VAD output — this cuts per-chunk memory by ~500x and
+    /// lets stitching merge speech spans directly without padding gaps
+    /// with zero bytes or re-running VAD.
+    vad_spans: Vec<TimeSpan>,
     sample_rate: i32,
     anchor_ids: Vec<Uuid>,
 }
@@ -375,17 +404,53 @@ impl AlignmentEngine {
             return Err("sample_rate must be 8000 or 16000".into());
         }
 
-        // ── 1. STITCH CHECK ──────────────────────────────────────────────
-        let (eff_pcm, eff_start, eff_end, stitch_evicted) =
-            self.stitch_check(pcm_data, film_start_ms, film_end_ms, sample_rate);
+        // ── 1. VAD ───────────────────────────────────────────────────────
+        // Run VAD on the fresh PCM immediately.  PCM is dropped at end of
+        // scope — only the VAD spans survive into the rest of the pipeline.
+        let fresh_spans =
+            vad::run_vad(&pcm_data, sample_rate, film_start_ms, self.config.vad_mode);
 
-        // ── 2. VAD ───────────────────────────────────────────────────────
-        let vad_spans = vad::run_vad(&eff_pcm, sample_rate, eff_start, self.config.vad_mode);
+        #[cfg(test)]
+        {
+            eprintln!("    [1 VAD] {} fresh spans from {}-{}ms",
+                fresh_spans.len(), film_start_ms, film_end_ms);
+            for (vi, vs) in fresh_spans.iter().enumerate() {
+                eprintln!("       vad[{}]: {}-{}ms", vi, i64::from(vs.start), i64::from(vs.end));
+            }
+        }
+
+        // ── 2. STITCH CHECK ──────────────────────────────────────────────
+        // Fold adjacent/overlapping stored chunks into this chunk's VAD
+        // spans.  Evicts any anchors that were pinned to the consumed
+        // chunks.
+        let (mut vad_spans, eff_start, eff_end, stitch_evicted) =
+            self.stitch_check(fresh_spans, film_start_ms, film_end_ms, sample_rate);
+
+        // Merge abutting/overlapping spans (handles speech that spanned
+        // a chunk boundary and was therefore split across two VAD runs).
+        merge_adjacent_spans(&mut vad_spans, 20);
+
+        #[cfg(test)]
+        eprintln!(
+            "    [2 STITCH] eff={}-{}ms ({}ms), evicted={}, total_spans={}, chunks_remaining={}",
+            eff_start, eff_end, eff_end - eff_start,
+            stitch_evicted, vad_spans.len(), self.chunks.len(),
+        );
+
         if vad_spans.is_empty() {
+            #[cfg(test)]
+            eprintln!("    → EXIT: no VAD spans");
             return Ok(Vec::new());
         }
 
         // ── 3. COARSE SWEEP ─────────────────────────────────────────────
+        // Global coarse delta computed from all accumulated VAD
+        // evidence (stored chunks + current).  Used as a tie-break
+        // prior when the local chunk's own evidence is too sparse to
+        // pick a unique winner (e.g. a single speech span that
+        // matches subtitle lines at many candidate shifts).
+        let global_prior = self.compute_global_coarse_delta(&vad_spans);
+
         let broad_start = eff_start - 2 * self.config.max_drift_ms;
         let broad_end = eff_end + 2 * self.config.max_drift_ms;
         let broad_window = self.subtitle_spans_in_range(broad_start, broad_end);
@@ -393,8 +458,15 @@ impl AlignmentEngine {
         let (coarse_delta, _coarse_score) = if broad_window.is_empty() {
             (0i64, 0.0)
         } else {
-            self.coarse_sweep(&vad_spans, &broad_window)
+            self.coarse_sweep(&vad_spans, &broad_window, global_prior)
         };
+
+        #[cfg(test)]
+        eprintln!(
+            "    [3 COARSE] broad_window={} subs in [{}, {}], global_prior={:?}, coarse_delta={}, score={:.4}",
+            broad_window.len(), broad_start, broad_end,
+            global_prior, coarse_delta, _coarse_score,
+        );
 
         // ── 4. EXTRACT SUBTITLE WINDOW ──────────────────────────────────
         let win_start = eff_start - self.config.max_drift_ms + coarse_delta
@@ -404,7 +476,15 @@ impl AlignmentEngine {
         let (window_spans, window_indices) =
             self.subtitle_window_with_indices(win_start, win_end);
 
+        #[cfg(test)]
+        eprintln!(
+            "    [4 WINDOW] [{}, {}] → {} subs, indices={:?}",
+            win_start, win_end, window_spans.len(), window_indices,
+        );
+
         if window_spans.is_empty() {
+            #[cfg(test)]
+            eprintln!("    → EXIT: empty subtitle window");
             return Ok(Vec::new());
         }
 
@@ -418,8 +498,19 @@ impl AlignmentEngine {
             NoProgressHandler,
         );
 
+        #[cfg(test)]
+        {
+            eprintln!("    [5 ALIGN] score={:.4}, {} deltas", score, deltas.len());
+            for (di, d) in deltas.iter().enumerate() {
+                eprintln!("       delta[{}] (line {}): {:+}ms", di, window_indices[di], d.as_i64());
+            }
+        }
+
         // ── 6. QUALITY GATE ─────────────────────────────────────────────
         if score < self.config.quality_threshold {
+            #[cfg(test)]
+            eprintln!("    → EXIT: quality gate ({:.4} < {:.4}), stitch_evicted={}",
+                score, self.config.quality_threshold, stitch_evicted);
             if stitch_evicted {
                 let changes = self.recompute_all_and_diff();
                 self.broadcast_changes(&changes);
@@ -433,16 +524,36 @@ impl AlignmentEngine {
         let new_anchors =
             self.extract_anchors(&deltas, &window_indices, score, chunk_id);
 
+        #[cfg(test)]
+        {
+            eprintln!("    [7 ANCHORS] {} new anchors", new_anchors.len());
+            for a in &new_anchors {
+                eprintln!("       anchor: pos={}ms, delta={:+}ms, conf={:.4}, lines={}-{}",
+                    a.film_position_ms, a.delta_ms, a.confidence, a.line_start, a.line_end);
+            }
+        }
+
         if new_anchors.is_empty() {
+            #[cfg(test)]
+            eprintln!("    → EXIT: no anchors extracted");
             return Ok(Vec::new());
         }
 
         // ── 8. CONFLICT RESOLUTION ──────────────────────────────────────
         let resolution = self.resolve_conflicts(&new_anchors);
+
+        #[cfg(test)]
+        eprintln!("    [8 CONFLICT] resolution={}", match &resolution {
+            None => "LOST (chunk rejected)".to_string(),
+            Some(ids) => format!("WON (evicting {} old anchors)", ids.len()),
+        });
+
         match resolution {
             None => {
                 // Chunk loses — only recompute if stitch evicted anchors
                 if stitch_evicted {
+                    #[cfg(test)]
+                    eprintln!("    → recomputing after stitch eviction despite conflict loss");
                     let changes = self.recompute_all_and_diff();
                     self.broadcast_changes(&changes);
                     return Ok(changes);
@@ -464,14 +575,14 @@ impl AlignmentEngine {
                 }
 
                 // ── 10. STORE CHUNK ──────────────────────────────────────
-                // PCM data is not retained — it was only needed for
-                // stitching during this ingest call.  Dropping it avoids
-                // unbounded memory growth for long sessions.
+                // Retain VAD spans (cheap: ~16 bytes per span) so future
+                // adjacent/overlapping chunks can stitch against real
+                // speech data instead of zero-padded PCM.
                 self.chunks.push(ProcessedChunk {
                     id: chunk_id,
                     film_start_ms: eff_start,
                     film_end_ms: eff_end,
-                    pcm_data: Vec::new(),
+                    vad_spans,
                     sample_rate,
                     anchor_ids,
                 });
@@ -488,15 +599,17 @@ impl AlignmentEngine {
     // Pipeline helpers
     // -----------------------------------------------------------------------
 
-    /// Step 1: scan chunk history for adjacent/overlapping chunks, merge PCM.
-    /// Returns `(pcm, start, end, anchors_evicted)`.
+    /// Step 2: scan chunk history for adjacent/overlapping chunks, merge
+    /// their VAD spans into this chunk's spans.  Returns the combined
+    /// spans (sorted by start time), the expanded time window, and a flag
+    /// indicating whether any anchors were evicted.
     fn stitch_check(
         &mut self,
-        mut pcm: Vec<u8>,
+        mut vad_spans: Vec<TimeSpan>,
         mut start: i64,
         mut end: i64,
         sample_rate: i32,
-    ) -> (Vec<u8>, i64, i64, bool) {
+    ) -> (Vec<TimeSpan>, i64, i64, bool) {
         let mut evicted_any = false;
 
         loop {
@@ -515,6 +628,14 @@ impl AlignmentEngine {
                 None => break,
                 Some(idx) => {
                     let chunk = self.chunks.remove(idx);
+
+                    #[cfg(test)]
+                    eprintln!(
+                        "    [STITCH] merging stored chunk {}-{}ms ({} vad spans, {} anchor_ids) into {}-{}ms",
+                        chunk.film_start_ms, chunk.film_end_ms,
+                        chunk.vad_spans.len(), chunk.anchor_ids.len(), start, end,
+                    );
+
                     // Evict old chunk's anchors
                     if !chunk.anchor_ids.is_empty() {
                         let evict: HashSet<Uuid> =
@@ -523,36 +644,18 @@ impl AlignmentEngine {
                         evicted_any = true;
                     }
 
-                    // Merge PCM in time order
-                    if chunk.film_start_ms <= start {
-                        // Old chunk comes first
-                        let gap_ms = start - chunk.film_end_ms;
-                        let gap_samples =
-                            (gap_ms.max(0) * sample_rate as i64 / 1000) as usize;
-                        let gap_bytes = gap_samples * 2;
-
-                        let mut merged = chunk.pcm_data;
-                        merged.resize(merged.len() + gap_bytes, 0u8);
-                        merged.extend_from_slice(&pcm);
-                        pcm = merged;
-                        start = chunk.film_start_ms;
-                    } else {
-                        // Old chunk comes after
-                        let gap_ms = chunk.film_start_ms - end;
-                        let gap_samples =
-                            (gap_ms.max(0) * sample_rate as i64 / 1000) as usize;
-                        let gap_bytes = gap_samples * 2;
-
-                        pcm.resize(pcm.len() + gap_bytes, 0u8);
-                        pcm.extend_from_slice(&chunk.pcm_data);
-                        end = chunk.film_end_ms;
-                    }
+                    // Absolute-time VAD spans can just be concatenated.
+                    // Ordering is restored with a sort at the end.
+                    vad_spans.extend(chunk.vad_spans);
+                    start = start.min(chunk.film_start_ms);
+                    end = end.max(chunk.film_end_ms);
                     // Continue looping (cascade)
                 }
             }
         }
 
-        (pcm, start, end, evicted_any)
+        vad_spans.sort_by_key(|s| i64::from(s.start));
+        (vad_spans, start, end, evicted_any)
     }
 
     /// Extract alass-core TimeSpans for subtitle lines whose original timing
@@ -595,14 +698,30 @@ impl AlignmentEngine {
     }
 
     /// Step 3: coarse sweep — evaluate nosplit score at discrete deltas.
+    ///
+    /// `prior` is the delta preferred on ties (within a small score
+    /// epsilon).  When sparse VAD evidence makes several deltas score
+    /// identically (e.g. 1 speech span matches subtitles at many shifts),
+    /// the tie-break picks the candidate closest to `prior`.  Callers
+    /// can pass the result of `compute_global_coarse_delta` as the prior
+    /// so accumulated timeline-wide evidence pulls the local decision
+    /// toward the globally-consistent answer.  When `prior` is `None`,
+    /// ties resolve to the delta closest to zero (no drift — the Occam
+    /// default).
     fn coarse_sweep(
         &self,
         vad_spans: &[TimeSpan],
         sub_spans: &[TimeSpan],
+        prior: Option<i64>,
     ) -> (i64, f64) {
         let max_d = self.config.max_drift_ms;
         let step = self.config.sweep_step_ms.max(1);
         let steps = max_d / step;
+        let prior = prior.unwrap_or(0);
+        // Score epsilon — two deltas are considered tied if within this.
+        // standard_scoring returns match values in [0, 1] per span so a
+        // few micro-units is safely below any real difference.
+        let eps = 1e-6_f64;
 
         let mut best_delta: i64 = 0;
         let mut best_score: f64 = f64::NEG_INFINITY;
@@ -620,13 +739,69 @@ impl AlignmentEngine {
                 alass_core::standard_scoring,
             );
 
-            if score > best_score {
+            if score > best_score + eps {
                 best_score = score;
                 best_delta = delta;
+            } else if (score - best_score).abs() <= eps {
+                // Tie within epsilon — prefer the delta closer to prior.
+                if (delta - prior).abs() < (best_delta - prior).abs() {
+                    best_delta = delta;
+                }
             }
         }
 
         (best_delta, best_score)
+    }
+
+    /// Run a coarse sweep over *all* accumulated VAD evidence (every
+    /// stored chunk's spans plus the freshly-stitched spans from the
+    /// current ingest) against the entire subtitle track.
+    ///
+    /// As evidence grows across ingests, the set of deltas that
+    /// score-tie narrows — the right answer stays in the tied set,
+    /// while spurious ones drop out once enough VAD spans disagree
+    /// with them.  The returned delta is intended as a tie-break
+    /// prior for the *local* coarse sweep of the current chunk.
+    ///
+    /// Returns `None` when there's insufficient evidence to
+    /// disambiguate (zero or one total VAD spans, or no subtitle
+    /// state loaded).
+    fn compute_global_coarse_delta(
+        &self,
+        current_spans: &[TimeSpan],
+    ) -> Option<i64> {
+        let sub = self.subtitle.as_ref()?;
+
+        // Gather all stored VAD spans + current.  Ordering doesn't
+        // affect get_nosplit_score, but we sort anyway for determinism.
+        let total_stored: usize =
+            self.chunks.iter().map(|c| c.vad_spans.len()).sum();
+        let mut all_spans: Vec<TimeSpan> =
+            Vec::with_capacity(total_stored + current_spans.len());
+        for chunk in &self.chunks {
+            all_spans.extend(chunk.vad_spans.iter().copied());
+        }
+        all_spans.extend(current_spans.iter().copied());
+
+        if all_spans.len() < 2 {
+            return None;
+        }
+        all_spans.sort_by_key(|s| i64::from(s.start));
+
+        let all_subs: Vec<TimeSpan> = sub
+            .original_timespans
+            .iter()
+            .map(|&(s, e)| TimeSpan::new(TimePoint::from(s), TimePoint::from(e)))
+            .collect();
+        if all_subs.is_empty() {
+            return None;
+        }
+
+        // Pass None prior → tie-break prefers delta=0 (no drift).  This
+        // avoids recursion and makes the global sweep a pure function
+        // of evidence.
+        let (delta, _score) = self.coarse_sweep(&all_spans, &all_subs, None);
+        Some(delta)
     }
 
     /// Step 7: group deltas into anchor groups, emit Anchors.
@@ -926,6 +1101,71 @@ Fifth line
         engine.load_subtitle(SAMPLE_SRT, "srt").unwrap();
     }
 
+    // -- E2E helpers --------------------------------------------------------
+
+    /// Generate synthetic 16-bit LE mono PCM where `speech_segments` contain
+    /// a 400 Hz sine wave and everything else is silence.  The WebRTC VAD
+    /// (mode 0) reliably classifies the sine-wave frames as speech.
+    ///
+    /// `speech_segments` are `(start_ms, end_ms)` **relative to the start of
+    /// the buffer** (i.e. sample 0 corresponds to ms 0).
+    fn make_speech_pcm(
+        sample_rate: i32,
+        speech_segments: &[(i64, i64)],
+        total_duration_ms: i64,
+    ) -> Vec<u8> {
+        let total_samples = (sample_rate as i64 * total_duration_ms / 1000) as usize;
+        let mut samples = vec![0i16; total_samples];
+
+        let freq = 400.0_f64;
+        let amplitude = 10_000.0_f64;
+
+        for &(start_ms, end_ms) in speech_segments {
+            let start_sample = (sample_rate as i64 * start_ms / 1000) as usize;
+            let end_sample = (sample_rate as i64 * end_ms / 1000) as usize;
+            let end_sample = end_sample.min(total_samples);
+            for i in start_sample..end_sample {
+                let t = i as f64 / sample_rate as f64;
+                samples[i] =
+                    (amplitude * (2.0 * std::f64::consts::PI * freq * t).sin()) as i16;
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(total_samples * 2);
+        for s in &samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Build a valid SRT string from `(start_ms, end_ms, text)` tuples.
+    fn make_srt(segments: &[(i64, i64, &str)]) -> String {
+        let mut out = String::new();
+        for (i, &(start, end, text)) in segments.iter().enumerate() {
+            out.push_str(&format!("{}\n", i + 1));
+            out.push_str(&format!(
+                "{} --> {}\n",
+                format_srt_time(start),
+                format_srt_time(end),
+            ));
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
+        out
+    }
+
+    /// Panics if `|actual - expected| > tolerance`.
+    fn assert_within(actual: i64, expected: i64, tolerance: i64, label: &str) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{}: expected ~{} +/- {}, got {}",
+            label,
+            expected,
+            tolerance,
+            actual,
+        );
+    }
+
     // -- LoadSubtitle -------------------------------------------------------
 
     #[test]
@@ -972,7 +1212,7 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 10000,
-            pcm_data: vec![],
+            vad_spans: vec![],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
@@ -1305,31 +1545,38 @@ Fifth line
 
     // -- stitch_check -------------------------------------------------------
 
+    fn ts(start_ms: i64, end_ms: i64) -> TimeSpan {
+        TimeSpan::new(TimePoint::from(start_ms), TimePoint::from(end_ms))
+    }
+
     #[test]
     fn stitch_merges_adjacent_after() {
         let mut eng = make_engine();
         load_sample(&mut eng);
 
-        // Pre-existing chunk: 0–5000ms
+        // Pre-existing chunk: 0–5000ms with speech at 1000-2000
         eng.chunks.push(ProcessedChunk {
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![1, 2, 3, 4],
+            vad_spans: vec![ts(1000, 2000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
-        // New chunk starting at 5000ms (within tolerance)
-        let new_pcm = vec![5, 6, 7, 8];
-        let (merged, start, end, _) = eng.stitch_check(new_pcm, 5000, 10000, 16000);
+        // New chunk starting at 5000ms (within tolerance) with speech at 6000-7000
+        let new_spans = vec![ts(6000, 7000)];
+        let (merged, start, end, _) = eng.stitch_check(new_spans, 5000, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 10000);
         assert!(eng.chunks.is_empty()); // old chunk consumed
-        // Merged PCM = old + gap(0) + new
-        assert!(merged.starts_with(&[1, 2, 3, 4]));
-        assert!(merged.ends_with(&[5, 6, 7, 8]));
+        // Merged spans are sorted by start: old first, then new
+        assert_eq!(merged.len(), 2);
+        assert_eq!(i64::from(merged[0].start), 1000);
+        assert_eq!(i64::from(merged[0].end), 2000);
+        assert_eq!(i64::from(merged[1].start), 6000);
+        assert_eq!(i64::from(merged[1].end), 7000);
     }
 
     #[test]
@@ -1337,24 +1584,25 @@ Fifth line
         let mut eng = make_engine();
         load_sample(&mut eng);
 
-        // Pre-existing chunk: 10000–20000ms
+        // Pre-existing chunk: 10000–20000ms with speech at 12000-13000
         eng.chunks.push(ProcessedChunk {
             id: Uuid::new_v4(),
             film_start_ms: 10000,
             film_end_ms: 20000,
-            pcm_data: vec![5, 6, 7, 8],
+            vad_spans: vec![ts(12000, 13000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
-        // New chunk ending at 10000ms
-        let new_pcm = vec![1, 2, 3, 4];
-        let (merged, start, end, _) = eng.stitch_check(new_pcm, 0, 10000, 16000);
+        // New chunk ending at 10000ms with speech at 3000-4000
+        let new_spans = vec![ts(3000, 4000)];
+        let (merged, start, end, _) = eng.stitch_check(new_spans, 0, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 20000);
-        assert!(merged.starts_with(&[1, 2, 3, 4]));
-        assert!(merged.ends_with(&[5, 6, 7, 8]));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(i64::from(merged[0].start), 3000);
+        assert_eq!(i64::from(merged[1].start), 12000);
     }
 
     #[test]
@@ -1377,12 +1625,12 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![0; 4],
+            vad_spans: vec![],
             sample_rate: 16000,
             anchor_ids: vec![anchor_id],
         });
 
-        let (_, _, _, evicted) = eng.stitch_check(vec![0; 4], 5000, 10000, 16000);
+        let (_, _, _, evicted) = eng.stitch_check(vec![], 5000, 10000, 16000);
         assert!(evicted, "stitch must report anchor eviction");
 
         assert!(eng.anchors.is_empty(), "stitched chunk's anchors must be evicted");
@@ -1398,7 +1646,7 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![1, 2],
+            vad_spans: vec![ts(1000, 2000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
@@ -1406,17 +1654,23 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 10000,
             film_end_ms: 15000,
-            pcm_data: vec![5, 6],
+            vad_spans: vec![ts(12000, 13000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
-        // New chunk fills the gap [5000–10000]
-        let (_, start, end, _) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
+        // New chunk fills the gap [5000–10000] with speech at 6000-7000
+        let (merged, start, end, _) =
+            eng.stitch_check(vec![ts(6000, 7000)], 5000, 10000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 15000);
         assert!(eng.chunks.is_empty(), "both old chunks consumed via cascade");
+        // All three spans survive, sorted
+        assert_eq!(merged.len(), 3);
+        assert_eq!(i64::from(merged[0].start), 1000);
+        assert_eq!(i64::from(merged[1].start), 6000);
+        assert_eq!(i64::from(merged[2].start), 12000);
     }
 
     #[test]
@@ -1428,16 +1682,19 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 5000,
-            pcm_data: vec![1, 2],
+            vad_spans: vec![ts(1000, 2000)],
             sample_rate: 8000, // different from incoming 16000
             anchor_ids: vec![],
         });
 
-        let (pcm, start, end, evicted) = eng.stitch_check(vec![3, 4], 5000, 10000, 16000);
+        let new_spans = vec![ts(6000, 7000)];
+        let (spans, start, end, evicted) =
+            eng.stitch_check(new_spans, 5000, 10000, 16000);
         assert!(!evicted, "no anchors to evict");
         assert_eq!(start, 5000);
         assert_eq!(end, 10000);
-        assert_eq!(pcm, vec![3, 4]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(i64::from(spans[0].start), 6000);
         assert_eq!(eng.chunks.len(), 1); // old chunk untouched
     }
 
@@ -1606,9 +1863,34 @@ Fifth line
             TimeSpan::new(TimePoint::from(7_000), TimePoint::from(8_000)),
         ];
 
-        let (delta, score) = eng.coarse_sweep(&vad, &subs);
+        let (delta, score) = eng.coarse_sweep(&vad, &subs, None);
         assert_eq!(delta, 5000);
         assert!(score > 0.0);
+    }
+
+    #[test]
+    fn coarse_sweep_prior_tie_break() {
+        let eng = make_engine();
+
+        // Single VAD span — highly ambiguous.  Many deltas tie.
+        let vad = vec![TimeSpan::new(
+            TimePoint::from(10_000),
+            TimePoint::from(11_000),
+        )];
+        // Subtitle at 7s–8s: delta +3000 matches.  Subtitle at 20s–21s:
+        // delta -10000 also matches.  Both score identically.
+        let subs = vec![
+            TimeSpan::new(TimePoint::from(7_000), TimePoint::from(8_000)),
+            TimeSpan::new(TimePoint::from(20_000), TimePoint::from(21_000)),
+        ];
+
+        // With no prior, the tie resolves to the delta closest to 0.
+        let (d_no_prior, _) = eng.coarse_sweep(&vad, &subs, None);
+        assert_eq!(d_no_prior, 3000);
+
+        // With a strong prior near -10000, the tie resolves the other way.
+        let (d_biased, _) = eng.coarse_sweep(&vad, &subs, Some(-10_000));
+        assert_eq!(d_biased, -10_000);
     }
 
     // -- nearest_anchor_confidence ------------------------------------------
@@ -1685,18 +1967,19 @@ Fifth line
             id: Uuid::new_v4(),
             film_start_ms: 0,
             film_end_ms: 10000,
-            pcm_data: vec![1, 2, 3, 4],
+            vad_spans: vec![ts(2000, 3000)],
             sample_rate: 16000,
             anchor_ids: vec![],
         });
 
         // New chunk overlaps: 5000–15000ms
-        let new_pcm = vec![5, 6, 7, 8];
-        let (_, start, end, _) = eng.stitch_check(new_pcm, 5000, 15000, 16000);
+        let new_spans = vec![ts(12000, 13000)];
+        let (merged, start, end, _) = eng.stitch_check(new_spans, 5000, 15000, 16000);
 
         assert_eq!(start, 0);
         assert_eq!(end, 15000);
         assert!(eng.chunks.is_empty());
+        assert_eq!(merged.len(), 2);
     }
 
     // -- set_config / config() accessor (#9) ----------------------------------
@@ -1711,5 +1994,609 @@ Fifth line
 
         assert_eq!(eng.config().vad_mode, 3);
         assert_eq!(eng.config().max_drift_ms, 60_000);
+    }
+
+    // =======================================================================
+    // E2E tests — full ingest_chunk pipeline
+    // =======================================================================
+
+    #[test]
+    fn test_make_speech_pcm_produces_vad_spans() {
+        let pcm = make_speech_pcm(16000, &[(1000, 4000), (6000, 9000)], 10000);
+        let spans = vad::run_vad(&pcm, 16000, 0, 0);
+
+        assert!(
+            spans.len() >= 2,
+            "expected at least 2 VAD spans, got {}",
+            spans.len()
+        );
+
+        // First span should cover approximately 1000-4000ms
+        let s0_start = i64::from(spans[0].start);
+        let s0_end = i64::from(spans[0].end);
+        assert_within(s0_start, 1000, 200, "span0 start");
+        assert_within(s0_end, 4000, 200, "span0 end");
+
+        // Second span should cover approximately 6000-9000ms
+        let s1_start = i64::from(spans[1].start);
+        let s1_end = i64::from(spans[1].end);
+        assert_within(s1_start, 6000, 200, "span1 start");
+        assert_within(s1_end, 9000, 200, "span1 end");
+    }
+
+    // -- e2e: silence rejected ----------------------------------------------
+
+    #[test]
+    fn e2e_silence_rejected() {
+        let mut eng = make_engine();
+        load_sample(&mut eng);
+
+        // 40 seconds of silence at 16kHz
+        let pcm = vec![0u8; 16000 * 2 * 40];
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 40000).unwrap();
+
+        assert!(changes.is_empty(), "silence should produce no changes");
+        assert!(eng.get_anchors().is_empty());
+        assert!(eng.get_chunk_history().is_empty());
+
+        // Corrected times unchanged
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..sub.original_timespans.len() {
+            assert_eq!(sub.corrected_start_ms[i], sub.original_timespans[i].0);
+            assert_eq!(sub.corrected_end_ms[i], sub.original_timespans[i].1);
+        }
+    }
+
+    // -- e2e: constant positive offset --------------------------------------
+
+    #[test]
+    fn e2e_constant_offset_positive() {
+        let mut eng = make_engine();
+        load_sample(&mut eng);
+
+        // Audio speech occurs 3s AFTER subtitle timings.
+        // SAMPLE_SRT lines: 1-4s, 5-8s, 10-13s, 20-23s, 30-33s
+        // Shifted +3s:       4-7s, 8-11s, 13-16s, 23-26s, 33-36s
+        let pcm = make_speech_pcm(
+            16000,
+            &[
+                (4000, 7000),
+                (8000, 11000),
+                (13000, 16000),
+                (23000, 26000),
+                (33000, 36000),
+            ],
+            40000,
+        );
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 40000).unwrap();
+
+        assert!(!changes.is_empty(), "should produce changes");
+
+        // All changed lines should have delta approximately +3000
+        for c in &changes {
+            assert_within(
+                c.new_start_ms - c.old_start_ms,
+                3000,
+                1500,
+                &format!("line {} start delta", c.line_index),
+            );
+        }
+
+        // Anchors exist with positive delta
+        let anchors = eng.get_anchors();
+        assert!(!anchors.is_empty(), "should have at least 1 anchor");
+        for a in &anchors {
+            assert_within(a.delta_ms, 3000, 1500, "anchor delta");
+        }
+
+        // One chunk in history
+        assert_eq!(eng.get_chunk_history().len(), 1);
+
+        // Exported SRT reflects correction
+        let srt = eng.export_srt().unwrap();
+        // Line 1 original: 00:00:01,000 → should now be ~00:00:04,000
+        assert!(
+            !srt.contains("00:00:01,000 --> 00:00:04,000"),
+            "original timestamps should no longer appear in exported SRT"
+        );
+    }
+
+    // -- e2e: constant negative offset --------------------------------------
+
+    #[test]
+    fn e2e_constant_offset_negative() {
+        let mut eng = make_engine();
+
+        // Use custom SRT with higher offsets to avoid clipping into negatives
+        let srt = make_srt(&[
+            (5000, 8000, "Line one"),
+            (10000, 13000, "Line two"),
+            (20000, 23000, "Line three"),
+            (30000, 33000, "Line four"),
+            (40000, 43000, "Line five"),
+        ]);
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // Audio speech occurs 3s BEFORE subtitle timings.
+        // Shifted -3s: 2-5s, 7-10s, 17-20s, 27-30s, 37-40s
+        let pcm = make_speech_pcm(
+            16000,
+            &[
+                (2000, 5000),
+                (7000, 10000),
+                (17000, 20000),
+                (27000, 30000),
+                (37000, 40000),
+            ],
+            50000,
+        );
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 50000).unwrap();
+
+        assert!(!changes.is_empty(), "should produce changes");
+
+        for c in &changes {
+            assert_within(
+                c.new_start_ms - c.old_start_ms,
+                -3000,
+                1500,
+                &format!("line {} start delta", c.line_index),
+            );
+        }
+
+        let anchors = eng.get_anchors();
+        assert!(!anchors.is_empty());
+        for a in &anchors {
+            assert_within(a.delta_ms, -3000, 1500, "anchor delta");
+        }
+    }
+
+    // -- e2e: poor match rejected by quality gate ---------------------------
+
+    #[test]
+    fn e2e_poor_match_rejected_by_quality_gate() {
+        let mut cfg = EngineConfig::default();
+        cfg.quality_threshold = 0.5; // raised to ensure rejection
+        let mut eng = test_engine(cfg);
+        load_sample(&mut eng);
+
+        // Single short speech burst that doesn't match subtitle pattern
+        let pcm = make_speech_pcm(16000, &[(19000, 19500)], 40000);
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 40000).unwrap();
+
+        assert!(
+            changes.is_empty(),
+            "poor match should be rejected by quality gate"
+        );
+        assert!(eng.get_anchors().is_empty());
+        assert!(eng.get_chunk_history().is_empty());
+    }
+
+    // -- e2e: multi-chunk progressive alignment -----------------------------
+
+    #[test]
+    fn e2e_multi_chunk_progressive() {
+        let mut cfg = EngineConfig::default();
+        cfg.stitch_tolerance_ms = 0; // prevent stitching
+        cfg.min_anchor_spacing_ms = 5000; // allow anchors closer together
+        cfg.max_drift_ms = 10000; // narrow window so each chunk sees only its lines
+        cfg.coverage_buffer_ms = 5000;
+        let mut eng = test_engine(cfg);
+
+        // Two well-separated groups so each chunk's window captures only its lines.
+        let srt = make_srt(&[
+            (5000, 8000, "Group A line 1"),
+            (10000, 13000, "Group A line 2"),
+            (15000, 18000, "Group A line 3"),
+            (80000, 83000, "Group B line 1"),
+            (85000, 88000, "Group B line 2"),
+            (90000, 93000, "Group B line 3"),
+        ]);
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // Offset: +2000ms
+
+        // Chunk 1: film 0-25s, covers group A shifted +2s
+        // Speech at (7-10s), (12-15s), (17-20s)
+        let pcm1 = make_speech_pcm(
+            16000,
+            &[(7000, 10000), (12000, 15000), (17000, 20000)],
+            25000,
+        );
+        let changes1 = eng.ingest_chunk(pcm1, 16000, 0, 25000).unwrap();
+        assert!(!changes1.is_empty(), "chunk 1 should produce changes");
+        assert!(
+            !eng.get_anchors().is_empty(),
+            "chunk 1 should create anchors"
+        );
+
+        let anchors_after_c1 = eng.get_anchors().len();
+
+        // Chunk 2: film 75-100s, covers group B shifted +2s
+        // Absolute speech: 82-85s, 87-90s, 92-95s
+        // Relative to chunk start (75s): 7-10s, 12-15s, 17-20s
+        let pcm2 = make_speech_pcm(
+            16000,
+            &[(7000, 10000), (12000, 15000), (17000, 20000)],
+            25000,
+        );
+        let _changes2 = eng.ingest_chunk(pcm2, 16000, 75000, 100000).unwrap();
+
+        // Chunk 2 should also produce changes or anchors
+        // (it may produce changes even if no new anchors, via recompute)
+        let anchors_after_c2 = eng.get_anchors().len();
+        assert!(
+            anchors_after_c2 >= anchors_after_c1,
+            "chunk 2 should add anchors (had {}, now {})",
+            anchors_after_c1,
+            anchors_after_c2,
+        );
+
+        // At least one chunk stored
+        assert!(
+            !eng.get_chunk_history().is_empty(),
+            "should have at least 1 chunk stored"
+        );
+
+        // All 6 lines should have corrected times ~+2000ms
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..6 {
+            let orig_start = sub.original_timespans[i].0;
+            assert_within(
+                sub.corrected_start_ms[i],
+                orig_start + 2000,
+                1500,
+                &format!("line {} corrected start", i),
+            );
+        }
+    }
+
+    // -- e2e: reset mid-session ---------------------------------------------
+
+    #[test]
+    fn e2e_reset_mid_session() {
+        let mut eng = make_engine();
+        load_sample(&mut eng);
+
+        // Phase 1: align with +3s offset
+        let pcm1 = make_speech_pcm(
+            16000,
+            &[
+                (4000, 7000),
+                (8000, 11000),
+                (13000, 16000),
+                (23000, 26000),
+                (33000, 36000),
+            ],
+            40000,
+        );
+        let changes1 = eng.ingest_chunk(pcm1, 16000, 0, 40000).unwrap();
+        assert!(!changes1.is_empty(), "phase 1 should produce changes");
+        assert!(!eng.get_anchors().is_empty(), "phase 1 should have anchors");
+
+        // Phase 2: reset
+        eng.reset();
+        assert!(eng.get_anchors().is_empty(), "reset should clear anchors");
+        assert!(
+            eng.get_chunk_history().is_empty(),
+            "reset should clear chunks"
+        );
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..5 {
+            assert_eq!(
+                sub.corrected_start_ms[i], sub.original_timespans[i].0,
+                "reset should restore original start for line {}",
+                i
+            );
+            assert_eq!(
+                sub.corrected_end_ms[i], sub.original_timespans[i].1,
+                "reset should restore original end for line {}",
+                i
+            );
+        }
+
+        // Phase 3: re-align with +5s offset
+        let pcm2 = make_speech_pcm(
+            16000,
+            &[
+                (6000, 9000),
+                (10000, 13000),
+                (15000, 18000),
+                (25000, 28000),
+                (35000, 38000),
+            ],
+            40000,
+        );
+        let changes2 = eng.ingest_chunk(pcm2, 16000, 0, 40000).unwrap();
+        assert!(!changes2.is_empty(), "phase 3 should produce changes");
+
+        // Should reflect +5s, not +3s from phase 1
+        for c in &changes2 {
+            assert_within(
+                c.new_start_ms - c.old_start_ms,
+                5000,
+                1500,
+                &format!("phase 3 line {} delta", c.line_index),
+            );
+        }
+
+        // Only 1 chunk in history (not 2)
+        assert_eq!(eng.get_chunk_history().len(), 1);
+    }
+
+    // -- e2e: split detection -----------------------------------------------
+
+    #[test]
+    fn e2e_split_detection() {
+        let mut eng = make_engine();
+
+        // Custom SRT with large gap between groups to make split clear
+        let srt = make_srt(&[
+            (5000, 8000, "Early A"),
+            (10000, 13000, "Early B"),
+            (30000, 33000, "Late A"),
+            (35000, 38000, "Late B"),
+        ]);
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // Lines 0-1 shifted +2s: speech at 7-10s, 12-15s
+        // Lines 2-3 shifted -3s: speech at 27-30s, 32-35s
+        let pcm = make_speech_pcm(
+            16000,
+            &[
+                (7000, 10000),
+                (12000, 15000),
+                (27000, 30000),
+                (32000, 35000),
+            ],
+            50000,
+        );
+
+        let changes = eng.ingest_chunk(pcm, 16000, 0, 50000).unwrap();
+        assert!(!changes.is_empty(), "should produce changes");
+
+        let anchors = eng.get_anchors();
+        assert!(
+            anchors.len() >= 2,
+            "should have at least 2 anchors for split, got {}",
+            anchors.len()
+        );
+
+        // Find anchors for each region
+        let early_anchor = anchors
+            .iter()
+            .find(|a| a.film_position_ms < 20000)
+            .expect("should have anchor for early region");
+        let late_anchor = anchors
+            .iter()
+            .find(|a| a.film_position_ms > 20000)
+            .expect("should have anchor for late region");
+
+        assert_within(early_anchor.delta_ms, 2000, 1500, "early anchor delta");
+        assert_within(late_anchor.delta_ms, -3000, 1500, "late anchor delta");
+
+        // Lines 0-1 should be shifted ~+2000
+        let sub = eng.subtitle.as_ref().unwrap();
+        for i in 0..2 {
+            assert_within(
+                sub.corrected_start_ms[i] - sub.original_timespans[i].0,
+                2000,
+                1500,
+                &format!("early line {} delta", i),
+            );
+        }
+        // Lines 2-3 should be shifted ~-3000
+        for i in 2..4 {
+            assert_within(
+                sub.corrected_start_ms[i] - sub.original_timespans[i].0,
+                -3000,
+                1500,
+                &format!("late line {} delta", i),
+            );
+        }
+    }
+
+    // -- e2e: streaming stress test -----------------------------------------
+
+    /// Simple deterministic LCG PRNG to avoid adding a rand dependency.
+    struct SimpleRng(u64);
+    impl SimpleRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        /// Returns a value in [0, bound).
+        fn next_range(&mut self, bound: u64) -> u64 {
+            // LCG parameters from Numerical Recipes
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) ^ (self.0 >> 17)) % bound
+        }
+        /// Returns a value in [lo, hi] inclusive.
+        fn range_inclusive(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + self.next_range((hi - lo + 1) as u64) as i64
+        }
+    }
+
+    #[test]
+    fn e2e_streaming_5min_random_chunks() {
+        // -----------------------------------------------------------
+        // Setup: 5-minute film with 20 subtitle lines, constant +3s offset
+        // -----------------------------------------------------------
+        let offset_ms: i64 = 3000;
+        let film_duration_ms: i64 = 300_000; // 5 minutes
+
+        // Generate 20 subtitle lines spread across the 5-minute range.
+        // Each line is 3s long with ~12s spacing.
+        let mut sub_segments: Vec<(i64, i64, &str)> = Vec::new();
+        let texts = [
+            "Line A", "Line B", "Line C", "Line D", "Line E",
+            "Line F", "Line G", "Line H", "Line I", "Line J",
+            "Line K", "Line L", "Line M", "Line N", "Line O",
+            "Line P", "Line Q", "Line R", "Line S", "Line T",
+        ];
+        for (i, text) in texts.iter().enumerate() {
+            let start = 5000 + (i as i64) * 14500; // ~14.5s apart
+            let end = start + 3000;
+            sub_segments.push((start, end, text));
+        }
+        // Last line ends at 5000 + 19*14500 + 3000 = 283500ms (within 300s)
+
+        let srt = make_srt(&sub_segments);
+
+        let mut eng = make_engine();
+        eng.load_subtitle(&srt, "srt").unwrap();
+
+        // -----------------------------------------------------------
+        // Generate random chunks spanning the 5-minute range
+        // -----------------------------------------------------------
+        let mut rng = SimpleRng::new(42); // fixed seed for reproducibility
+
+        // Build chunks: start near 0, advance with random-sized chunks
+        // and random gaps (positive = gap, negative = overlap)
+        let mut chunks: Vec<(i64, i64)> = Vec::new();
+        let mut cursor: i64 = 0;
+
+        while cursor < film_duration_ms {
+            let chunk_len = rng.range_inclusive(10_000, 30_000); // 10-30s
+            let chunk_start = cursor;
+            let chunk_end = (chunk_start + chunk_len).min(film_duration_ms);
+            chunks.push((chunk_start, chunk_end));
+
+            // Random gap/overlap: -5s to +10s
+            let gap = rng.range_inclusive(-5000, 10000);
+            cursor = chunk_end + gap;
+            if cursor < chunk_start + 1000 {
+                // Don't go backwards too far — keep some forward progress
+                cursor = chunk_end + 1000;
+            }
+        }
+
+        let num_chunks = chunks.len();
+
+        // -----------------------------------------------------------
+        // For each chunk, generate PCM with speech matching the
+        // subtitle lines that fall within the chunk's time range,
+        // shifted by the offset.
+        // -----------------------------------------------------------
+        let mut total_changes: Vec<proto::LineChange> = Vec::new();
+        let mut ingest_errors = 0;
+
+        eprintln!("--- Streaming {} chunks over {}ms ---", num_chunks, film_duration_ms);
+
+        for (ci, &(chunk_start, chunk_end)) in chunks.iter().enumerate() {
+            let chunk_duration = chunk_end - chunk_start;
+
+            // Find subtitle lines whose offset-shifted position overlaps this chunk
+            let mut speech_segments: Vec<(i64, i64)> = Vec::new();
+            for &(sub_start, sub_end, _) in &sub_segments {
+                // The "true" audio position of this line is sub timing + offset
+                let audio_start = sub_start + offset_ms;
+                let audio_end = sub_end + offset_ms;
+
+                // Clip to chunk boundaries
+                if audio_end > chunk_start && audio_start < chunk_end {
+                    let seg_start = (audio_start - chunk_start).max(0);
+                    let seg_end = (audio_end - chunk_start).min(chunk_duration);
+                    if seg_end > seg_start {
+                        speech_segments.push((seg_start, seg_end));
+                    }
+                }
+            }
+
+            let pcm = make_speech_pcm(16000, &speech_segments, chunk_duration);
+
+            eprintln!(
+                "  chunk {:2}/{}: film {:6}-{:6}ms ({:5}ms), {} speech segments",
+                ci + 1,
+                num_chunks,
+                chunk_start,
+                chunk_end,
+                chunk_duration,
+                speech_segments.len(),
+            );
+
+            match eng.ingest_chunk(pcm, 16000, chunk_start, chunk_end) {
+                Ok(changes) => {
+                    if !changes.is_empty() {
+                        eprintln!("           → {} line changes", changes.len());
+                        total_changes.extend(changes);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("           → ERROR: {}", e);
+                    ingest_errors += 1;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Assertions
+        // -----------------------------------------------------------
+        assert_eq!(ingest_errors, 0, "no ingest errors should occur");
+
+        let anchors = eng.get_anchors();
+        eprintln!(
+            "\n--- Results: {} anchors, {} total line-change events ---",
+            anchors.len(),
+            total_changes.len(),
+        );
+
+        // Must have produced at least some anchors
+        assert!(
+            !anchors.is_empty(),
+            "streaming should have produced at least 1 anchor"
+        );
+
+        // Check that the final corrected times are close to the expected offset
+        let sub = eng.subtitle.as_ref().unwrap();
+        let num_lines = sub.original_timespans.len();
+        let mut correct_count = 0;
+        let tolerance = 2000; // 2s tolerance for streaming with gaps/overlaps
+
+        eprintln!("\n--- Per-line results (expected delta = {}ms) ---", offset_ms);
+        for i in 0..num_lines {
+            let orig = sub.original_timespans[i].0;
+            let corrected = sub.corrected_start_ms[i];
+            let actual_delta = corrected - orig;
+            let close = (actual_delta - offset_ms).abs() <= tolerance;
+            if close {
+                correct_count += 1;
+            }
+            eprintln!(
+                "  line {:2}: orig={:6}ms, corrected={:6}ms, delta={:+6}ms {}",
+                i, orig, corrected, actual_delta,
+                if close { "OK" } else { "MISS" },
+            );
+        }
+
+        eprintln!(
+            "\n--- {}/{} lines within {}ms of expected delta ---",
+            correct_count, num_lines, tolerance,
+        );
+
+        // At least 75% of lines should be correctly aligned
+        let required = (num_lines * 3) / 4;
+        assert!(
+            correct_count >= required,
+            "expected at least {}/{} lines within {}ms of target delta {}, got {}",
+            required,
+            num_lines,
+            tolerance,
+            offset_ms,
+            correct_count,
+        );
+
+        // Verify the exported SRT is parseable and non-empty
+        let srt_out = eng.export_srt().unwrap();
+        assert!(!srt_out.is_empty(), "exported SRT should not be empty");
+
+        // Verify chunk history exists
+        assert!(
+            !eng.get_chunk_history().is_empty(),
+            "should have chunk history",
+        );
+
+        eprintln!("\n--- PASS ---");
     }
 }
